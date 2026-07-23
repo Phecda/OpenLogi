@@ -430,7 +430,7 @@ async fn walk_bolt_slot(
         // offline fallback.
         kind: resolve_device_kind(probe.kind, register_kind),
         online,
-        battery: probe.battery,
+        battery: online.then_some(probe.battery).flatten(),
         model_info: probe.model_info,
         capabilities: probe.capabilities,
     };
@@ -659,22 +659,33 @@ async fn probe_unifying_slot(
         (probe, CacheOutcome::Seen(id))
     };
 
-    let device = PairedDevice {
+    // Reachable on this receiver iff the feature walk got through this tick.
+    // Caveat: a cache hit can serve stale capabilities for up to REFRESH_TICKS
+    // after the device leaves for Bluetooth, briefly showing it online; the next
+    // forced re-probe self-heals the state.
+    let online = probe.capabilities.is_some();
+    let device = assemble_unifying_device(slot, codename, event.wpid, register_kind, probe, online);
+    Some((device, outcome))
+}
+
+pub(super) fn assemble_unifying_device(
+    slot: u8,
+    codename: Option<String>,
+    wpid: u16,
+    register_kind: DeviceKind,
+    probe: ProbedFeatures,
+    online: bool,
+) -> PairedDevice {
+    PairedDevice {
         slot,
         codename,
-        wpid: Some(event.wpid),
+        wpid: Some(wpid),
         kind: resolve_device_kind(probe.kind, register_kind),
-        // Reachable on this receiver iff the feature walk got through this tick.
-        // Caveat: a GUI cache hit can serve stale capabilities for up to
-        // REFRESH_TICKS after the device leaves for Bluetooth, briefly showing it
-        // online; self-heals on the next forced re-probe. Add a per-tick liveness
-        // ping if that window ever matters.
-        online: probe.capabilities.is_some(),
-        battery: probe.battery,
+        online,
+        battery: online.then_some(probe.battery).flatten(),
         model_info: probe.model_info,
         capabilities: probe.capabilities,
-    };
-    Some((device, outcome))
+    }
 }
 
 /// Reads a Unifying paired device's name. Unifying stores names at
