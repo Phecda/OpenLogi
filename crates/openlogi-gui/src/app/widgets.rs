@@ -15,6 +15,7 @@ use openlogi_core::device::{BatteryInfo, BatteryStatus, DeviceKind};
 use openlogi_hid::DeviceRoute;
 
 use super::AppView;
+use crate::i18n::battery_value_label;
 use crate::state::AppState;
 use crate::theme::{self, Palette, Typography as _};
 
@@ -133,11 +134,16 @@ pub(super) fn status_badge(online: bool, pal: Palette) -> impl IntoElement {
 }
 
 pub(super) fn battery_summary(battery: &BatteryInfo, pal: Palette) -> impl IntoElement {
-    let status = match battery.status {
-        BatteryStatus::Charging | BatteryStatus::ChargingSlow => tr!("Charging"),
-        BatteryStatus::Full => tr!("Full"),
-        BatteryStatus::Error => tr!("Battery error"),
-        BatteryStatus::Discharging | BatteryStatus::Unknown => tr!("Battery"),
+    let percentage = battery.percentage;
+    let title = if percentage.is_some() {
+        match battery.status {
+            BatteryStatus::Charging | BatteryStatus::ChargingSlow => tr!("Charging"),
+            BatteryStatus::Full => tr!("Full"),
+            BatteryStatus::Error => tr!("Battery error"),
+            BatteryStatus::Discharging | BatteryStatus::Unknown => tr!("Battery"),
+        }
+    } else {
+        tr!("Battery")
     };
     v_flex()
         .gap_2()
@@ -146,23 +152,25 @@ pub(super) fn battery_summary(battery: &BatteryInfo, pal: Palette) -> impl IntoE
                 .justify_between()
                 .text_caption()
                 .text_color(pal.text_muted)
-                .child(status)
-                .child(format!("{}%", battery.percentage)),
+                .child(title)
+                .child(battery_value_label(battery)),
         )
-        .child(
-            div()
-                .h(px(6.))
-                .w_full()
-                .rounded_full()
-                .bg(pal.surface_hover)
-                .child(
-                    div()
-                        .h_full()
-                        .w(relative(f32::from(battery.percentage.clamp(1, 100)) / 100.))
-                        .rounded_full()
-                        .bg(rgb(battery_color(battery.percentage))),
-                ),
-        )
+        .when_some(percentage, |this, percentage| {
+            this.child(
+                div()
+                    .h(px(6.))
+                    .w_full()
+                    .rounded_full()
+                    .bg(pal.surface_hover)
+                    .child(
+                        div()
+                            .h_full()
+                            .w(relative(f32::from(percentage.clamp(1, 100)) / 100.))
+                            .rounded_full()
+                            .bg(rgb(battery_color(percentage))),
+                    ),
+            )
+        })
 }
 
 fn battery_color(percentage: u8) -> u32 {

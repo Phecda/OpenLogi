@@ -427,13 +427,32 @@ fn connection_label(connection: ConnectionKind) -> &'static str {
 
 fn battery_label(battery: Option<&BatteryInfo>) -> String {
     match battery {
-        Some(b) => format!(
-            "{}% ({}, {})",
-            b.percentage,
-            battery_status_label(b.status),
-            battery_level_label(b.level),
-        ),
+        Some(b) => match b.percentage {
+            Some(percentage) => format!(
+                "{percentage}% ({}, {})",
+                battery_status_label(b.status),
+                battery_level_label(b.level),
+            ),
+            None => coarse_battery_label(b),
+        },
         None => "n/a".to_string(),
+    }
+}
+
+fn coarse_battery_label(battery: &BatteryInfo) -> String {
+    match battery.status {
+        BatteryStatus::Charging
+        | BatteryStatus::ChargingSlow
+        | BatteryStatus::Full
+        | BatteryStatus::Error => battery_status_label(battery.status).to_string(),
+        BatteryStatus::Discharging | BatteryStatus::Unknown => {
+            let level = battery_level_label(battery.level);
+            if matches!(battery.level, crate::device::BatteryLevel::Unknown) {
+                "unknown".to_string()
+            } else {
+                format!("{level} ({})", battery_status_label(battery.status))
+            }
+        }
     }
 }
 
@@ -505,7 +524,7 @@ fn opt_num<T: std::fmt::Display>(value: Option<T>) -> String {
 mod tests {
     use super::{
         AppInfo, AssetInfo, AssetSource, ConnectionKind, DeviceDiag, DiagnosticsReport,
-        InventoryState, ReceiverDiag, RenderState,
+        InventoryState, ReceiverDiag, RenderState, battery_label,
     };
     use crate::device::{
         BatteryInfo, BatteryLevel, BatteryStatus, Capabilities, DeviceKind, DeviceTransports,
@@ -564,7 +583,7 @@ mod tests {
                     connection: ConnectionKind::BoltReceiver,
                     online: true,
                     battery: Some(BatteryInfo {
-                        percentage: 80,
+                        percentage: Some(80),
                         level: BatteryLevel::Good,
                         status: BatteryStatus::Discharging,
                     }),
@@ -647,6 +666,26 @@ mod tests {
         assert!(md.contains("Transports: USB"));
         assert!(md.contains("Render: mx_master_3s · Slot 1"));
         assert!(md.contains("Battery: n/a"));
+    }
+
+    #[test]
+    fn coarse_battery_does_not_invent_a_percentage() {
+        let battery = BatteryInfo {
+            percentage: None,
+            level: BatteryLevel::Good,
+            status: BatteryStatus::Discharging,
+        };
+        assert_eq!(battery_label(Some(&battery)), "good (discharging)");
+    }
+
+    #[test]
+    fn coarse_battery_prioritizes_charging_status() {
+        let battery = BatteryInfo {
+            percentage: None,
+            level: BatteryLevel::Unknown,
+            status: BatteryStatus::Charging,
+        };
+        assert_eq!(battery_label(Some(&battery)), "charging");
     }
 
     #[test]

@@ -36,7 +36,7 @@ use openlogi_agent_core::orchestrator::Orchestrator;
 use openlogi_agent_core::{hook_runtime, watchers};
 use openlogi_core::config::Config;
 use openlogi_hook::Hook;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -151,6 +151,11 @@ async fn run(config: Config) {
     // Pairing runs in the agent (it owns device I/O); the GUI drives it over IPC.
     let pairing = Arc::new(pairing::PairingManager::new(shared.clone()));
 
+    // Coalesce battery broadcasts while no GUI long-poll is waiting. `Notify`
+    // retains one permit, which is enough because the RPC returns the latest
+    // whole snapshot rather than every intermediate edge.
+    let battery_notifications = Arc::new(Notify::new());
+
     // The HID++ control watcher (gesture button, DPI/ModeShift button, thumb
     // wheel) needs no Accessibility permission — start it up front. It reads the
     // shared maps and dispatches bound actions itself; the two pairing flags let
@@ -178,6 +183,7 @@ async fn run(config: Config) {
         hook_installed: Arc::clone(&hook_installed),
         pairing: Arc::clone(&pairing),
         event_monitor: Arc::clone(&event_monitor),
+        battery_notifications: Arc::clone(&battery_notifications),
     };
     tokio::spawn(server::run(server));
 
@@ -195,6 +201,15 @@ async fn run(config: Config) {
             event = inventory_rx.recv(), if inventory_open => match event {
                 Some(watchers::inventory::InventoryEvent::Snapshot(inventories)) => {
                     orchestrator.lock().await.refresh_inventory(&inventories);
+                }
+                Some(watchers::inventory::InventoryEvent::Battery(update)) => {
+                    if orchestrator
+                        .lock()
+                        .await
+                        .update_battery(&update.route, update.battery)
+                    {
+                        battery_notifications.notify_one();
+                    }
                 }
                 Some(watchers::inventory::InventoryEvent::Unavailable) => {
                     orchestrator.lock().await.mark_inventory_unavailable();

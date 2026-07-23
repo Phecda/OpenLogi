@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Args;
-use openlogi_core::device::{BatteryInfo, DeviceInventory, DeviceModelInfo, PairedDevice};
+use openlogi_core::device::{
+    BatteryInfo, BatteryLevel, BatteryStatus, DeviceInventory, DeviceModelInfo, PairedDevice,
+};
 
 #[derive(Debug, Args)]
 pub struct ListArgs {}
@@ -79,7 +81,22 @@ fn format_device(d: &PairedDevice) -> String {
 fn format_battery(b: &BatteryInfo) -> String {
     let level = format!("{:?}", b.level).to_lowercase();
     let status = format!("{:?}", b.status).to_lowercase();
-    format!("battery={}% {level} ({status})", b.percentage)
+    match b.percentage {
+        Some(percentage) => format!("battery={percentage}% {level} ({status})"),
+        None => match b.status {
+            BatteryStatus::Charging
+            | BatteryStatus::ChargingSlow
+            | BatteryStatus::Full
+            | BatteryStatus::Error => format!("battery={status}"),
+            BatteryStatus::Discharging | BatteryStatus::Unknown => {
+                if b.level == BatteryLevel::Unknown {
+                    "battery=unknown".to_string()
+                } else {
+                    format!("battery={level} ({status})")
+                }
+            }
+        },
+    }
 }
 
 fn format_model(m: &DeviceModelInfo) -> String {
@@ -169,7 +186,7 @@ mod format_tests {
     fn battery_info_is_embedded_when_present() {
         let mut d = base_device();
         d.battery = Some(BatteryInfo {
-            percentage: 42,
+            percentage: Some(42),
             level: BatteryLevel::Low,
             status: BatteryStatus::Discharging,
         });
@@ -182,11 +199,31 @@ mod format_tests {
         // `ChargingSlow`'s Debug form has no separator; lowercasing alone
         // yields "chargingslow", not "charging_slow" or "charging slow".
         let b = BatteryInfo {
-            percentage: 10,
+            percentage: Some(10),
             level: BatteryLevel::Critical,
             status: BatteryStatus::ChargingSlow,
         };
         assert_eq!(format_battery(&b), "battery=10% critical (chargingslow)");
+    }
+
+    #[test]
+    fn coarse_battery_omits_a_fake_percentage() {
+        let b = BatteryInfo {
+            percentage: None,
+            level: BatteryLevel::Good,
+            status: BatteryStatus::Discharging,
+        };
+        assert_eq!(format_battery(&b), "battery=good (discharging)");
+    }
+
+    #[test]
+    fn status_only_battery_prioritizes_charging() {
+        let b = BatteryInfo {
+            percentage: None,
+            level: BatteryLevel::Unknown,
+            status: BatteryStatus::Charging,
+        };
+        assert_eq!(format_battery(&b), "battery=charging");
     }
 
     fn base_model() -> DeviceModelInfo {

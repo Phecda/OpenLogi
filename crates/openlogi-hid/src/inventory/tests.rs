@@ -1,11 +1,15 @@
 use std::{collections::HashSet, error::Error, io, sync::Arc};
 
-use hidpp::channel::{HidppChannel, RawHidChannel};
+use hidpp::{
+    channel::{HidppChannel, RawHidChannel},
+    feature::{CreatableFeature as _, unified_battery::UnifiedBatteryFeature},
+};
 use openlogi_core::device::{
     Capabilities, DeviceInventory, DeviceKind, PairedDevice, ReceiverInfo,
 };
 use tokio::sync::{Mutex, mpsc};
 
+use super::battery::{BatteryEventContext, BatteryHandle};
 use super::cache::{CACHE_MISS_GRACE, CacheKey, CacheOutcome, Cached, REFRESH_TICKS, is_stale};
 use super::probe::{
     NodeProbe, assemble_bolt_probe, assemble_unifying_device, parse_codename_unifying,
@@ -17,7 +21,7 @@ use crate::inventory::features::ProbedFeatures;
 fn cache_entry(probed_tick: u64) -> Cached {
     Cached {
         probe: ProbedFeatures::default(),
-        battery_index: None,
+        battery_handle: None,
         probed_tick,
     }
 }
@@ -78,7 +82,7 @@ fn live_cached_channel_survives_a_transient_enumeration_gap() {
 fn cached_probe_is_reused_until_refresh_ticks() {
     let cached = Cached {
         probe: ProbedFeatures::default(),
-        battery_index: None,
+        battery_handle: None,
         probed_tick: 10,
     };
     assert!(!is_stale(&cached, 10), "same tick is fresh");
@@ -201,11 +205,24 @@ async fn unifying_battery_failure_uses_root_ping_before_marking_offline() {
             capabilities: Some(Capabilities::default()),
             ..ProbedFeatures::default()
         },
-        battery_index: Some(4),
+        battery_handle: Some(BatteryHandle::unified(
+            UnifiedBatteryFeature::new(Arc::clone(&channel), 1, 4),
+            false,
+            None,
+            None,
+        )),
         probed_tick: 10,
     };
 
-    let (_, _, online) = probe_unifying_features(&channel, 1, &id, Some(&cached), 11).await;
+    let (_, _, online) = probe_unifying_features(
+        &channel,
+        1,
+        &id,
+        Some(&cached),
+        11,
+        BatteryEventContext::new(None, None),
+    )
+    .await;
 
     assert!(
         online,

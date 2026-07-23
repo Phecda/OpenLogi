@@ -16,12 +16,14 @@ use hidpp::{
     },
 };
 use openlogi_core::device::{DeviceInventory, DeviceKind, PairedDevice, ReceiverInfo};
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::mappings::{map_kind, map_unifying_kind, resolve_device_kind};
-use crate::route::DIRECT_DEVICE_INDEX;
+use crate::route::{DIRECT_DEVICE_INDEX, DeviceRoute};
 
+use super::battery::{BatteryEventContext, BatteryUpdate};
 use super::cache::{CacheKey, CacheOutcome, Cached, probe_or_reuse, seen};
 use super::features::ProbedFeatures;
 use super::{ARRIVAL_DRAIN, BOLT_SLOT_PROBE, MAX_BOLT_SLOTS, UNIFYING_SLOT_PROBE};
@@ -56,18 +58,21 @@ pub(super) async fn probe_one(
     channel: Arc<HidppChannel>,
     cache: &HashMap<CacheKey, Cached>,
     tick: u64,
+    battery_events: Option<&mpsc::UnboundedSender<BatteryUpdate>>,
 ) -> NodeProbe {
     match receiver::detect(Arc::clone(&channel)) {
-        Some(Receiver::Bolt(bolt)) => probe_bolt_receiver(channel, info, bolt, cache, tick).await,
+        Some(Receiver::Bolt(bolt)) => {
+            probe_bolt_receiver(channel, info, bolt, cache, tick, battery_events).await
+        }
         Some(Receiver::Unifying(unifying)) => {
-            probe_unifying_receiver(channel, info, unifying, cache, tick).await
+            probe_unifying_receiver(channel, info, unifying, cache, tick, battery_events).await
         }
         None | Some(_) => {
             // No recognised receiver — this might be a directly-paired device
             // (Bluetooth-direct, USB-C cable). HID++ at device-index 0xff
             // addresses the device's own features. Probe in case it answers.
             // P2.4 — verified path; no Bolt-pairing slot indirection needed.
-            probe_direct(channel, &info, cache, tick).await
+            probe_direct(channel, &info, cache, tick, battery_events).await
         }
     }
 }
@@ -78,6 +83,7 @@ async fn probe_bolt_receiver(
     bolt: BoltReceiver,
     cache: &HashMap<CacheKey, Cached>,
     tick: u64,
+    battery_events: Option<&mpsc::UnboundedSender<BatteryUpdate>>,
 ) -> NodeProbe {
     let unique_id = bolt.get_unique_id().await.ok();
     let pairing_count = bolt.count_pairings().await.ok();
@@ -111,7 +117,16 @@ async fn probe_bolt_receiver(
     // device list stable across ticks without an explicit sort.
     let slot_results = identities
         .iter()
-        .map(|identity| walk_bolt_slot(&channel, identity, cache, tick))
+        .map(|identity| {
+            walk_bolt_slot(
+                &channel,
+                identity,
+                unique_id.as_deref(),
+                cache,
+                tick,
+                battery_events,
+            )
+        })
         .collect::<Vec<_>>()
         .join()
         .await;
@@ -168,6 +183,7 @@ async fn probe_unifying_receiver(
     unifying: UnifyingReceiver,
     cache: &HashMap<CacheKey, Cached>,
     tick: u64,
+    battery_events: Option<&mpsc::UnboundedSender<BatteryUpdate>>,
 ) -> NodeProbe {
     let unique_id = unifying.get_unique_id().await.ok();
     let pairing_count = unifying.count_pairings().await.ok();
@@ -221,7 +237,17 @@ async fn probe_unifying_receiver(
     };
     let slot_results = connections
         .iter()
-        .map(|conn| probe_unifying_slot(&channel, conn, receiver_uid, cache, tick))
+        .map(|conn| {
+            probe_unifying_slot(
+                &channel,
+                conn,
+                receiver_uid,
+                unique_id.as_deref(),
+                cache,
+                tick,
+                battery_events,
+            )
+        })
         .collect::<Vec<_>>()
         .join()
         .await;
@@ -338,8 +364,10 @@ async fn read_bolt_slot_identity(
 async fn walk_bolt_slot(
     channel: &Arc<HidppChannel>,
     identity: &BoltSlotIdentity,
+    receiver_uid: Option<&str>,
     cache: &HashMap<CacheKey, Cached>,
     tick: u64,
+    battery_events: Option<&mpsc::UnboundedSender<BatteryUpdate>>,
 ) -> (PairedDevice, CacheOutcome) {
     let &BoltSlotIdentity {
         slot,
@@ -350,6 +378,10 @@ async fn walk_bolt_slot(
     } = identity;
     let id = identity.id.clone();
     let cached = id.as_ref().and_then(|i| cache.get(i));
+    let route = receiver_uid.map(|receiver_uid| DeviceRoute::Bolt {
+        receiver_uid: receiver_uid.to_string(),
+        slot,
+    });
 
     // Cap the feature walk per slot so one device that stops answering can't
     // burn the whole receiver's `PROBE_BUDGET` and time out `probe_one` — which
@@ -358,7 +390,15 @@ async fn walk_bolt_slot(
     // mirroring the Unifying path (#218).
     let probe_result = timeout(
         BOLT_SLOT_PROBE,
-        probe_or_reuse(channel, slot, id.clone(), cached, online, tick),
+        probe_or_reuse(
+            channel,
+            slot,
+            id.clone(),
+            cached,
+            online,
+            tick,
+            BatteryEventContext::new(route.as_ref(), battery_events),
+        ),
     )
     .await;
     let (probe, outcome) = if let Ok(r) = probe_result {
@@ -413,13 +453,26 @@ async fn probe_direct(
     info: &async_hid::DeviceInfo,
     cache: &HashMap<CacheKey, Cached>,
     tick: u64,
+    battery_events: Option<&mpsc::UnboundedSender<BatteryUpdate>>,
 ) -> NodeProbe {
     let id = CacheKey::Direct(info.id.clone());
     let cached = cache.get(&id);
     // A direct device is always "present" (its HID node is the candidate), so
     // treat it as online: reuse the cached probe while fresh, otherwise probe.
-    let (probe, outcome) =
-        probe_or_reuse(&channel, DIRECT_DEVICE_INDEX, Some(id), cached, true, tick).await;
+    let route = DeviceRoute::Direct {
+        vendor_id: info.vendor_id,
+        product_id: info.product_id,
+    };
+    let (probe, outcome) = probe_or_reuse(
+        &channel,
+        DIRECT_DEVICE_INDEX,
+        Some(id),
+        cached,
+        true,
+        tick,
+        BatteryEventContext::new(Some(&route), battery_events),
+    )
+    .await;
     // Hybrid peripheral discriminator. A genuine directly-attached device is
     // either wireless/Bluetooth — which reports a battery — or exposes a
     // configuration feature (buttons / pointer / lighting). A Bolt receiver's
@@ -548,9 +601,11 @@ async fn drain_device_arrival_unifying(
 async fn probe_unifying_slot(
     channel: &Arc<HidppChannel>,
     event: &UnifyingDeviceConnection,
-    receiver_uid: &str,
+    cache_receiver_uid: &str,
+    route_receiver_uid: Option<&str>,
     cache: &HashMap<CacheKey, Cached>,
     tick: u64,
+    battery_events: Option<&mpsc::UnboundedSender<BatteryUpdate>>,
 ) -> Option<(PairedDevice, CacheOutcome)> {
     let slot = event.index;
     let codename = read_codename_unifying(channel, slot).await;
@@ -566,11 +621,15 @@ async fn probe_unifying_slot(
     // Cache key: full receiver serial + slot so two Unifying receivers with
     // a device on the same slot number never share a cache entry.
     let id = CacheKey::UnifyingSlot {
-        receiver_uid: receiver_uid.to_string(),
+        receiver_uid: cache_receiver_uid.to_string(),
         slot,
     };
     let cached = cache.get(&id);
     let register_kind = map_unifying_kind(event.kind);
+    let route = route_receiver_uid.map(|receiver_uid| DeviceRoute::Unifying {
+        receiver_uid: receiver_uid.to_string(),
+        slot,
+    });
 
     // `trigger_device_arrival` re-broadcasts a 0x41 for *every* paired slot,
     // online or not, and the crate's `event.online` reads the wrong notification
@@ -581,7 +640,14 @@ async fn probe_unifying_slot(
     // invisible to the agent's volatile-state re-apply/capture re-arm path.
     let probe_result = timeout(
         UNIFYING_SLOT_PROBE,
-        probe_unifying_features(channel, slot, &id, cached, tick),
+        probe_unifying_features(
+            channel,
+            slot,
+            &id,
+            cached,
+            tick,
+            BatteryEventContext::new(route.as_ref(), battery_events),
+        ),
     )
     .await;
     let (probe, outcome, online) = if let Ok(r) = probe_result {
@@ -610,9 +676,18 @@ pub(super) async fn probe_unifying_features(
     id: &CacheKey,
     cached: Option<&Cached>,
     tick: u64,
+    battery_context: BatteryEventContext<'_>,
 ) -> (ProbedFeatures, CacheOutcome, bool) {
-    let (probe, outcome) =
-        probe_or_reuse(channel, slot, Some(id.clone()), cached, true, tick).await;
+    let (probe, outcome) = probe_or_reuse(
+        channel,
+        slot,
+        Some(id.clone()),
+        cached,
+        true,
+        tick,
+        battery_context,
+    )
+    .await;
     let online = if matches!(outcome, CacheOutcome::Fresh(..) | CacheOutcome::Update(..)) {
         true
     } else {

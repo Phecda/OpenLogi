@@ -4,7 +4,8 @@
 //! is strict request/response — no server push — so the streaming needs become
 //! polling: the GUI polls [`Agent::snapshot`] on a timer, and the Add Device
 //! flow long-polls [`Agent::next_pairing`], which the agent holds open until a
-//! pairing event arrives or the request deadline elapses.
+//! pairing event arrives or the request deadline elapses. Battery broadcasts
+//! use the same suspended-request pattern via [`Agent::next_battery_update`].
 
 use openlogi_core::config::Lighting;
 use openlogi_core::device::DeviceInventory;
@@ -28,7 +29,9 @@ use serde::{Deserialize, Serialize};
 /// v8: [`WriteError`] carries typed HID++ operation failures.
 /// v9: `poll_event_monitor` appended + [`MonitorEvent`] (live event monitor).
 /// v10: `Capabilities::hires_wheel` appended.
-pub const PROTOCOL_VERSION: u32 = 10;
+/// v11: `BatteryInfo::percentage` changed to `Option<u8>` and
+/// `next_battery_update` appended.
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// Where the agent's device enumeration stands. The distinction matters
 /// because an empty inventory list is ambiguous on its own: the GUI must keep
@@ -275,4 +278,8 @@ pub trait Agent {
     /// there is no explicit stop. Appended last — see the method-order note on
     /// [`Agent::protocol_version`].
     async fn poll_event_monitor() -> Vec<MonitorEvent>;
+    /// Wait for an unsolicited battery broadcast and return the latest whole
+    /// snapshot. Returns `None` when the hold window elapses; the GUI reissues
+    /// the request. Appended last for protocol v11.
+    async fn next_battery_update() -> Option<AgentSnapshot>;
 }

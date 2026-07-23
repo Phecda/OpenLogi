@@ -61,7 +61,7 @@ fn assert_wire<T: serde::Serialize>(value: &T, golden: &str) {
 /// that makes that visible in the same diff.
 #[test]
 fn protocol_version_is_pinned() {
-    assert_eq!(PROTOCOL_VERSION, 10);
+    assert_eq!(PROTOCOL_VERSION, 11);
 }
 
 /// tarpc encodes the request enum's variant index, so trait *method order* is
@@ -83,6 +83,7 @@ fn request_variant_order() {
     assert_wire(&AgentRequest::NextPairing {}, "0d");
     assert_wire(&AgentRequest::Snapshot {}, "0e");
     assert_wire(&AgentRequest::PollEventMonitor {}, "0f");
+    assert_wire(&AgentRequest::NextBatteryUpdate {}, "10");
 }
 
 #[test]
@@ -155,7 +156,7 @@ fn device_inventory() {
             kind: DeviceKind::Mouse,
             online: true,
             battery: Some(BatteryInfo {
-                percentage: 80,
+                percentage: Some(80),
                 level: BatteryLevel::Good,
                 status: BatteryStatus::Discharging,
             }),
@@ -183,7 +184,7 @@ fn device_inventory() {
     }];
     assert_wire(
         &inventory,
-        "010d426f6c74205265636569766572fb6d04fb48c501084630304443414645010101094d58204d535452335301fb34b000010150020001030106323134304c5a0102030400010100fb34b0fb8240000b010101000001",
+        "010d426f6c74205265636569766572fb6d04fb48c501084630304443414645010101094d58204d535452335301fb34b00001010150020001030106323134304c5a0102030400010100fb34b0fb8240000b010101000001",
     );
 }
 

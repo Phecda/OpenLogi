@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use openlogi_core::config::{Config, ScrollResolution};
-use openlogi_core::device::{Capabilities, DeviceInventory};
+use openlogi_core::device::{BatteryInfo, Capabilities, DeviceInventory};
 use openlogi_hid::{CaptureChannel, DeviceRoute};
 use tracing::{debug, warn};
 
@@ -245,6 +245,29 @@ impl Orchestrator {
                 .wrapping_add(1);
             debug!(generation, "selected device requires capture re-arm");
         }
+    }
+
+    /// Apply an unsolicited battery update to the matching device in the last
+    /// completed inventory. Returns `true` only when a device was found and its
+    /// battery value changed.
+    pub fn update_battery(&mut self, route: &DeviceRoute, battery: BatteryInfo) -> bool {
+        let InventoryState::Ready(inventories) = &mut self.inventory else {
+            return false;
+        };
+        for inventory in inventories {
+            let matching = inventory.paired.iter().position(|device| {
+                DeviceRoute::device_route_for(inventory, device.slot).as_ref() == Some(route)
+            });
+            let Some(device) = matching.and_then(|index| inventory.paired.get_mut(index)) else {
+                continue;
+            };
+            if device.battery.as_ref() == Some(&battery) {
+                return false;
+            }
+            device.battery = Some(battery);
+            return true;
+        }
+        false
     }
 
     /// Force a volatile-settings re-apply for every online device on the next
@@ -559,8 +582,8 @@ mod tests {
     };
     use openlogi_core::config::{Config, ScrollResolution};
     use openlogi_core::device::{
-        Capabilities, DeviceInventory, DeviceKind, DeviceModelInfo, DeviceTransports, PairedDevice,
-        ReceiverInfo,
+        BatteryInfo, BatteryLevel, BatteryStatus, Capabilities, DeviceInventory, DeviceKind,
+        DeviceModelInfo, DeviceTransports, PairedDevice, ReceiverInfo,
     };
     use openlogi_hid::{DIRECT_DEVICE_INDEX, DeviceRoute};
 
@@ -617,6 +640,27 @@ mod tests {
         }
     }
 
+    fn battery_inventory(receiver_uid: &str, slot: u8) -> DeviceInventory {
+        DeviceInventory {
+            receiver: ReceiverInfo {
+                name: "Unifying Receiver".to_string(),
+                vendor_id: 0x046d,
+                product_id: 0xc52b,
+                unique_id: Some(receiver_uid.to_string()),
+            },
+            paired: vec![PairedDevice {
+                slot,
+                codename: None,
+                wpid: None,
+                kind: DeviceKind::Mouse,
+                online: true,
+                battery: None,
+                model_info: None,
+                capabilities: None,
+            }],
+        }
+    }
+
     #[test]
     fn build_devices_skips_transient_zero_unit_direct_identity() {
         assert!(build_devices(&[direct_inventory(None, [0; 4])]).is_empty());
@@ -666,6 +710,14 @@ mod tests {
             direct_inventory_state(0xb034, None, [2, 0, 0, 0], true),
         ]);
         assert_eq!(orchestrator.current_key(), Some(other_key));
+    }
+
+    fn charging_battery() -> BatteryInfo {
+        BatteryInfo {
+            percentage: None,
+            level: BatteryLevel::Full,
+            status: BatteryStatus::Charging,
+        }
     }
 
     #[test]
@@ -854,5 +906,39 @@ mod tests {
         assert_eq!(orch.inventory_health(), InventoryHealth::Ready);
         orch.mark_inventory_unavailable();
         assert_eq!(orch.inventory_health(), InventoryHealth::Ready);
+    }
+
+    #[test]
+    fn battery_update_targets_receiver_and_slot() {
+        let mut orch = Orchestrator::new(Config::default());
+        orch.refresh_inventory(&[
+            battery_inventory("receiver-a", 1),
+            battery_inventory("receiver-b", 1),
+        ]);
+        let route = DeviceRoute::Unifying {
+            receiver_uid: "receiver-b".to_string(),
+            slot: 1,
+        };
+
+        assert!(orch.update_battery(&route, charging_battery()));
+        let inventory = orch.inventory();
+        assert_eq!(inventory[0].paired[0].battery, None);
+        assert_eq!(inventory[1].paired[0].battery, Some(charging_battery()));
+        assert!(
+            !orch.update_battery(&route, charging_battery()),
+            "an unchanged broadcast must not wake the GUI"
+        );
+    }
+
+    #[test]
+    fn battery_update_ignores_unknown_or_unready_inventory() {
+        let route = DeviceRoute::Unifying {
+            receiver_uid: "receiver-a".to_string(),
+            slot: 1,
+        };
+        let mut orch = Orchestrator::new(Config::default());
+        assert!(!orch.update_battery(&route, charging_battery()));
+        orch.refresh_inventory(&[battery_inventory("receiver-b", 1)]);
+        assert!(!orch.update_battery(&route, charging_battery()));
     }
 }

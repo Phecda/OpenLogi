@@ -183,8 +183,7 @@ pub enum BatteryLevel {
     Full = 1 << 3,
 }
 
-/// Represents the charging status of the battery, as reported in the `0x1004`
-/// `getStatus` battery-status byte.
+/// Represents the charging status shared by the HID++ battery features.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, IntoPrimitive, TryFromPrimitive)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]

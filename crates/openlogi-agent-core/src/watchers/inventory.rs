@@ -42,6 +42,8 @@ const WAKE_GAP: Duration = Duration::from_mins(1);
 pub enum InventoryEvent {
     /// A completed enumeration — empty means "checked, no devices".
     Snapshot(Vec<DeviceInventory>),
+    /// An unsolicited HID++ battery broadcast from one known device.
+    Battery(openlogi_hid::BatteryUpdate),
     /// Enumeration has never succeeded and won't be treated as "still
     /// starting" any longer; without this the GUI would show its scanning
     /// state forever on a broken HID backend.
@@ -129,7 +131,19 @@ pub fn spawn(period: Duration) -> mpsc::UnboundedReceiver<InventoryEvent> {
             // A persistent enumerator so its per-device probe cache survives
             // across ticks — a known device's immutable data (model, features)
             // is reused instead of being re-handshaked every poll.
-            let mut enumerator = openlogi_hid::Enumerator::default();
+            let (battery_tx, mut battery_rx) = mpsc::unbounded_channel();
+            let mut enumerator = openlogi_hid::Enumerator::with_battery_events(battery_tx);
+            let battery_worker_tx = worker_tx.clone();
+            rt.spawn(async move {
+                while let Some(update) = battery_rx.recv().await {
+                    if battery_worker_tx
+                        .send(InventoryEvent::Battery(update))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
             let mut state = WatchState::default();
             let mut last_tick = SystemTime::now();
             // `block_on` installs runtime context so a backend that registers an

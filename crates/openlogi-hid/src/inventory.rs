@@ -11,16 +11,19 @@ use futures_concurrency::future::Join as _;
 use hidpp::channel::HidppChannel;
 use openlogi_core::device::DeviceInventory;
 use thiserror::Error;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::node_ledger::NodeLedger;
 use crate::transport::{enumerate_hidpp_devices, open_hidpp_channel};
 
+mod battery;
 mod cache;
 mod features;
 mod probe;
 
+pub use battery::BatteryUpdate;
 use cache::{CACHE_MISS_GRACE, CacheKey, CacheOutcome, Cached};
 use probe::{NodeProbe, probe_one};
 
@@ -106,6 +109,9 @@ pub struct Enumerator {
     /// node's snapshot through transient probe failures and decides when its
     /// cached channel must be dropped and reopened (see [`crate::node_ledger`]).
     ledger: NodeLedger<async_hid::DeviceId>,
+    /// Optional sink for unsolicited HID++ battery broadcasts. One-shot
+    /// enumeration leaves this unset; the long-lived agent watcher installs it.
+    battery_events: Option<mpsc::UnboundedSender<BatteryUpdate>>,
     tick: u64,
 }
 
@@ -249,6 +255,16 @@ fn append_live_cached_channels(
 }
 
 impl Enumerator {
+    /// Build a persistent enumerator that forwards unsolicited battery
+    /// broadcasts while its cached feature handles remain alive.
+    #[must_use]
+    pub fn with_battery_events(events: mpsc::UnboundedSender<BatteryUpdate>) -> Self {
+        Self {
+            battery_events: Some(events),
+            ..Self::default()
+        }
+    }
+
     /// One enumeration pass, reusing the cache from prior passes. Probes every
     /// HID candidate concurrently (so one asleep node that burns the whole
     /// `PROBE_BUDGET` can't stall the others), reusing each device's cached
@@ -330,11 +346,16 @@ impl Enumerator {
         // updates are collected and applied afterwards (no `RefCell`).
         let results = {
             let cache = &self.cache;
+            let battery_events = self.battery_events.as_ref();
             active
                 .into_iter()
                 .map(|(info, channel)| async move {
                     let node = info.id.clone();
-                    let probe = timeout(PROBE_BUDGET, probe_one(info, channel, cache, tick)).await;
+                    let probe = timeout(
+                        PROBE_BUDGET,
+                        probe_one(info, channel, cache, tick, battery_events),
+                    )
+                    .await;
                     (node, probe)
                 })
                 .collect::<Vec<_>>()
