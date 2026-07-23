@@ -193,10 +193,10 @@ impl Orchestrator {
     /// Apply a fresh inventory snapshot. Always refreshes the snapshot the IPC
     /// `inventory()` poll serves (battery / online state changes without
     /// altering the device *set*), but only re-picks the selection and rebuilds
-    /// the shared maps when the device set actually changed — `rebuild()` is
-    /// driven solely by `config_key` + route and resets the live DPI-cycle
-    /// index, so running it every 2s tick on an unchanged set would snap DPI
-    /// back to `preset[0]` (and burn three `RwLock` writes) for nothing.
+    /// the shared maps when the device set or runtime selection changed —
+    /// `rebuild()` resets the live DPI-cycle index, so running it every 2s tick
+    /// on a steady selection would snap DPI back to `preset[0]` (and burn three
+    /// `RwLock` writes) for nothing.
     pub fn refresh_inventory(&mut self, inventories: &[DeviceInventory]) {
         // Even an empty snapshot is a *completed* enumeration — the watcher
         // skips failed ticks — so the device set is now known either way (and
@@ -220,7 +220,8 @@ impl Orchestrator {
         for idx in targets {
             self.reapply_volatile_settings(&devices[idx]);
         }
-        let changed = devices.len() != self.devices.len()
+        let changed = next_current != self.current
+            || devices.len() != self.devices.len()
             || devices.iter().zip(&self.devices).any(|(a, b)| {
                 a.config_key != b.config_key
                     || a.route != b.route
@@ -526,13 +527,16 @@ fn plan_reapply(
     (targets, next_followup)
 }
 
-/// Index of the selected device: the one whose `config_key` matches the saved
-/// selection, else the first. `build_devices` sorts by the same canonical key
-/// the GUI carousel uses, so "the first" is the same physical device in both
-/// processes even when nothing is persisted yet.
+/// Index of the device that owns the live bindings and HID++ capture target.
+/// Prefer the saved GUI selection while it is online, otherwise the first
+/// online device. If every device is offline, preserve the saved selection so
+/// its configuration remains stable until a device reconnects.
 fn pick_current(devices: &[AgentDevice], saved: Option<&str>) -> usize {
+    let saved = saved.and_then(|key| devices.iter().position(|d| d.config_key == key));
     saved
-        .and_then(|key| devices.iter().position(|d| d.config_key == key))
+        .filter(|&idx| devices[idx].online)
+        .or_else(|| devices.iter().position(|device| device.online))
+        .or(saved)
         .unwrap_or(0)
 }
 
@@ -550,7 +554,7 @@ fn write_value<T>(lock: &RwLock<T>, value: T, name: &str) {
 mod tests {
     use super::{
         AgentDevice, InventoryHealth, Orchestrator, build_devices, configured_wheel_mode,
-        plan_reapply, reapply_targets, selected_needs_capture_rearm,
+        pick_current, plan_reapply, reapply_targets, selected_needs_capture_rearm,
     };
     use openlogi_core::config::{Config, ScrollResolution};
     use openlogi_core::device::{
@@ -576,11 +580,20 @@ mod tests {
     }
 
     fn direct_inventory(serial_number: Option<&str>, unit_id: [u8; 4]) -> DeviceInventory {
+        direct_inventory_state(0xb023, serial_number, unit_id, true)
+    }
+
+    fn direct_inventory_state(
+        product_id: u16,
+        serial_number: Option<&str>,
+        unit_id: [u8; 4],
+        online: bool,
+    ) -> DeviceInventory {
         DeviceInventory {
             receiver: ReceiverInfo {
                 name: "MX Master 3S".to_string(),
                 vendor_id: 0x046d,
-                product_id: 0xb023,
+                product_id,
                 unique_id: None,
             },
             paired: vec![PairedDevice {
@@ -588,14 +601,14 @@ mod tests {
                 codename: Some("MX Master 3S".to_string()),
                 wpid: None,
                 kind: DeviceKind::Mouse,
-                online: true,
+                online,
                 battery: None,
                 model_info: Some(DeviceModelInfo {
                     entity_count: 1,
                     serial_number: serial_number.map(str::to_string),
                     unit_id,
                     transports: DeviceTransports::default(),
-                    model_ids: [0xb034, 0, 0],
+                    model_ids: [product_id, 0, 0],
                     extended_model_id: 2,
                 }),
                 capabilities: Some(Capabilities::presumed_from_kind(DeviceKind::Mouse)),
@@ -610,6 +623,48 @@ mod tests {
         let devices = build_devices(&[direct_inventory(Some("ABC123"), [0; 4])]);
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].config_key, "direct:046d:b023:serial:abc123");
+    }
+
+    #[test]
+    fn runtime_selection_falls_back_from_saved_offline_device_to_online_device() {
+        let devices = [dev("saved", 1, false), dev("online", 2, true)];
+
+        assert_eq!(pick_current(&devices, Some("saved")), 1);
+    }
+
+    #[test]
+    fn runtime_selection_keeps_saved_device_when_it_is_online() {
+        let devices = [dev("other", 1, true), dev("saved", 2, true)];
+
+        assert_eq!(pick_current(&devices, Some("saved")), 1);
+    }
+
+    #[test]
+    fn runtime_selection_keeps_saved_device_when_all_devices_are_offline() {
+        let devices = [dev("other", 1, false), dev("saved", 2, false)];
+
+        assert_eq!(pick_current(&devices, Some("saved")), 1);
+    }
+
+    #[test]
+    fn runtime_selection_tracks_online_transition_without_device_set_change() {
+        let saved_key = "direct:046d:b023:unit:01000000";
+        let other_key = "direct:046d:b034:unit:02000000";
+        let mut config = Config::default();
+        config.set_selected_device(Some(saved_key.to_string()));
+        let mut orchestrator = Orchestrator::new(config);
+
+        orchestrator.refresh_inventory(&[
+            direct_inventory_state(0xb023, None, [1, 0, 0, 0], true),
+            direct_inventory_state(0xb034, None, [2, 0, 0, 0], false),
+        ]);
+        assert_eq!(orchestrator.current_key(), Some(saved_key));
+
+        orchestrator.refresh_inventory(&[
+            direct_inventory_state(0xb023, None, [1, 0, 0, 0], false),
+            direct_inventory_state(0xb034, None, [2, 0, 0, 0], true),
+        ]);
+        assert_eq!(orchestrator.current_key(), Some(other_key));
     }
 
     #[test]
