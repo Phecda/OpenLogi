@@ -226,10 +226,13 @@ fn device_menu_items(cx: &App) -> Vec<MenuItem> {
                     }
                     None => record.display_name.clone(),
                 };
-                items.push(MenuItem::action(title, OpenSettings).disabled(true));
+                items.push(MenuItem::action(title, gpui::NoAction).disabled(true));
             }
         }
-        _ => items.push(MenuItem::action(tr!("No devices connected"), OpenSettings).disabled(true)),
+        _ => {
+            items
+                .push(MenuItem::action(tr!("No devices connected"), gpui::NoAction).disabled(true));
+        }
     }
 
     items
