@@ -39,28 +39,23 @@ sits beneath both.
 
 ## Build, run, verify
 
-The toolchain lives in a devenv (Nix) shell — **cargo is not on the bare PATH**. Run
-everything through direnv from the repo root, including git (the hooks need cargo):
+Use the locally installed Rust toolchain and command-line tools directly. **Do not invoke commands through Nix, devenv, direnv, or similar environment wrappers.** Run `cargo`, `rustc`, `git`, and other tools directly from the repo root. If a required tool is missing from `PATH`, stop and report the missing prerequisite instead of activating or installing a Nix environment.
 
 ```sh
-direnv exec . cargo clippy --workspace --all-targets -- -D warnings
-direnv exec . git commit …
+cargo clippy --workspace --all-targets -- -D warnings
+git commit …
 ```
 
-- Full local gate (same as CI): `devenv tasks run openlogi:check` = `fmt --check` +
-  `clippy -D warnings` + workspace tests. It must pass before every commit.
+- Full local gate (same as CI): run `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` directly. All three must pass before every commit.
 - prek hooks (`prek.toml`): `cargo fmt` at commit; full-workspace clippy at push
   (rust-scoped, so non-Rust pushes skip it).
-- The macOS GUI build needs full Xcode for GPUI's Metal shaders; devenv sets
-  `DEVELOPER_DIR`/`SDKROOT`. If the shader compile fails, `direnv reload` first.
+- The macOS GUI build needs full Xcode for GPUI's Metal shaders. If shader compilation fails, verify the local Xcode installation and selected developer directory; do not switch to Nix or direnv as a workaround.
 - Dev-run the app with `cargo run -p openlogi-gui` — a cargo runner wraps it into
   `target/dev/OpenLogi.app`. `cargo build` does NOT refresh that bundle, and a second
   instance exits on the singleton lock: quit the old instance and re-`run` before
   judging a UI change "not applied".
 - macOS-green proves nothing about cfg-gated code. CI's linux/windows jobs are the
-  authoritative check (`RUSTFLAGS=-D warnings` globally, so plain warnings fail too);
-  `devenv tasks run openlogi:check-windows` cross-lints the ring-free subset locally.
-  Don't claim cross-platform success without CI.
+  authoritative check (`RUSTFLAGS=-D warnings` globally, so plain warnings fail too). Cross-lint locally by running `cargo clippy --target x86_64-pc-windows-gnu -p openlogi-core -p openlogi-hidpp -p openlogi-hid -p openlogi-hook -p openlogi-agent -p openlogi-agent-core --all-targets -- -D warnings` directly. Don't claim cross-platform success without CI.
 
 ## Rust standards
 
