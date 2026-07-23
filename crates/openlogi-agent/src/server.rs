@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use futures::StreamExt as _;
 use openlogi_agent_core::event_monitor::SharedEventMonitor;
@@ -29,7 +30,7 @@ use interprocess::local_socket::traits::tokio::Listener as _;
 use openlogi_hook::Hook;
 use tarpc::context::Context;
 use tarpc::server::{BaseChannel, Channel as _};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tracing::{info, warn};
 
 /// Shared handle to the agent's state, cloned per connection (and per request).
@@ -40,6 +41,31 @@ pub struct AgentServer {
     pub hook_installed: Arc<AtomicBool>,
     pub pairing: Arc<PairingManager>,
     pub event_monitor: SharedEventMonitor,
+    pub battery_notifications: Arc<Notify>,
+}
+
+impl AgentServer {
+    async fn current_snapshot(&self) -> AgentSnapshot {
+        let (launch_at_login, inventory_health, inventory) = {
+            let orch = self.orchestrator.lock().await;
+            (
+                orch.launch_at_login(),
+                orch.inventory_health(),
+                orch.inventory(),
+            )
+        };
+        AgentSnapshot {
+            status: AgentStatus {
+                accessibility_granted: Hook::has_accessibility(),
+                hook_installed: self.hook_installed.load(Ordering::Relaxed),
+                launch_at_login,
+                inventory: inventory_health,
+                protocol_version: PROTOCOL_VERSION,
+                agent_version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+            inventory,
+        }
+    }
 }
 
 impl Agent for AgentServer {
@@ -147,29 +173,23 @@ impl Agent for AgentServer {
     }
 
     async fn snapshot(self, _: Context) -> AgentSnapshot {
-        let (launch_at_login, inventory_health, inventory) = {
-            let orch = self.orchestrator.lock().await;
-            (
-                orch.launch_at_login(),
-                orch.inventory_health(),
-                orch.inventory(),
-            )
-        };
-        AgentSnapshot {
-            status: AgentStatus {
-                accessibility_granted: Hook::has_accessibility(),
-                hook_installed: self.hook_installed.load(Ordering::Relaxed),
-                launch_at_login,
-                inventory: inventory_health,
-                protocol_version: PROTOCOL_VERSION,
-                agent_version: env!("CARGO_PKG_VERSION").to_string(),
-            },
-            inventory,
-        }
+        self.current_snapshot().await
     }
 
     async fn poll_event_monitor(self, _: Context) -> Vec<MonitorEvent> {
         self.event_monitor.poll()
+    }
+
+    async fn next_battery_update(self, _: Context) -> Option<AgentSnapshot> {
+        match tokio::time::timeout(
+            Duration::from_secs(20),
+            self.battery_notifications.notified(),
+        )
+        .await
+        {
+            Ok(()) => Some(self.current_snapshot().await),
+            Err(_) => None,
+        }
     }
 }
 

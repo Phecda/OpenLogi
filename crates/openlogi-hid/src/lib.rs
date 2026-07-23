@@ -36,7 +36,7 @@ pub use hires_wheel::{
     set_scroll_resolution_on, set_scroll_wheel_mode, set_scroll_wheel_mode_on,
 };
 pub use hotplug::{HotplugEvent, watch_hotplug};
-pub use inventory::{Enumerator, InventoryError, enumerate};
+pub use inventory::{BatteryUpdate, Enumerator, InventoryError, enumerate};
 pub use pairing::{
     Click, DiscoveredDevice, PairingCommand, PairingError, PairingEvent, PairingReceiver,
     PasskeyMethod, ReceiverFamily, ReceiverSelector, list_pairing_receivers, run_pairing, unpair,

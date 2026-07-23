@@ -6,6 +6,8 @@
 //! "apply now" / "read" device commands. Both run on one dedicated OS thread with a
 //! tokio runtime (the GPUI thread owns no async runtime), mirroring the old
 //! watcher pattern: results cross back over `mpsc` to the GPUI loop.
+//! Unsolicited battery changes use a suspended long-poll on a second connection;
+//! the timer poll remains the reconciliation path for missed events.
 //!
 //! The single client connection is re-established by this loop itself: polling
 //! runs at [`STARTUP_POLL_PERIOD`] until the agent's first completed
@@ -137,6 +139,7 @@ pub fn spawn(poll_period: Duration) -> IpcClient {
                 // Pairing events stream on their own connection + long-poll so
                 // a held next_pairing never delays the snapshot poll.
                 tokio::spawn(pairing_poll(pairing_tx.clone()));
+                tokio::spawn(battery_poll(update_tx.clone()));
                 poll_loop(poll_period, &update_tx, &pairing_tx, &mut cmd_rx).await;
             });
         });
@@ -324,6 +327,41 @@ async fn poll_pairing_once(
         }
         Ok(None) => Ok(true),
         Err(_) => Err(()),
+    }
+}
+
+/// Wait for agent-side HID++ battery broadcasts on a dedicated connection.
+/// The request is suspended while idle; the regular snapshot poll remains the
+/// fallback if the device or transport drops a broadcast.
+async fn battery_poll(tx: mpsc::UnboundedSender<GuiUpdate>) {
+    let mut client: Option<AgentClient> = None;
+    loop {
+        let result = if let Ok(client) = ensure(&mut client).await {
+            let mut ctx = context::current();
+            ctx.deadline = Instant::now() + Duration::from_secs(25);
+            client.next_battery_update(ctx).await
+        } else {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        };
+        match result {
+            Ok(Some(snapshot)) => {
+                if tx
+                    .send(GuiUpdate::Snapshot(PollUpdate {
+                        inventory: snapshot.inventory,
+                        status: snapshot.status,
+                    }))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Ok(None) => {}
+            Err(_) => {
+                client = None;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
     }
 }
 

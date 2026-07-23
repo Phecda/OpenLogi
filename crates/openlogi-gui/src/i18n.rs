@@ -16,6 +16,7 @@
 
 use fluent_langneg::{LanguageIdentifier, NegotiationStrategy, negotiate_languages};
 use openlogi_core::config::AppSettings;
+use openlogi_core::device::{BatteryInfo, BatteryLevel, BatteryStatus};
 
 /// Locales the GUI ships, as `(code, native name)`. The codes match the
 /// `locales/*.yml` filenames; a subset (`en`, `zh-CN`, `zh-HK`, `it`) also
@@ -145,6 +146,28 @@ pub fn apply(settings: &AppSettings) {
     activate(settings.language.as_deref());
 }
 
+/// User-facing battery value for compact surfaces such as the home gallery and
+/// device menu. Exact devices show a percentage; coarse devices show status or
+/// level text without inventing a numeric value.
+pub fn battery_value_label(battery: &BatteryInfo) -> String {
+    if let Some(percentage) = battery.percentage {
+        return format!("{percentage}%");
+    }
+
+    match battery.status {
+        BatteryStatus::Charging | BatteryStatus::ChargingSlow => tr!("Charging").to_string(),
+        BatteryStatus::Full => tr!("Full").to_string(),
+        BatteryStatus::Error => tr!("Battery error").to_string(),
+        BatteryStatus::Discharging | BatteryStatus::Unknown => match battery.level {
+            BatteryLevel::Critical => tr!("Critical").to_string(),
+            BatteryLevel::Low => tr!("Low").to_string(),
+            BatteryLevel::Good => tr!("Good").to_string(),
+            BatteryLevel::Full => tr!("Nearly full").to_string(),
+            BatteryLevel::Unknown => tr!("Battery level unavailable").to_string(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +240,32 @@ mod tests {
         assert_eq!(rust_i18n::t!("No devices connected"), "未连接设备"); // menu-bar device line
         assert_eq!(rust_i18n::t!("Lighting"), "灯光"); // keyboard lighting tab
         assert_eq!(rust_i18n::t!("BRIGHTNESS"), "亮度"); // lighting panel label
+        assert_eq!(rust_i18n::t!("Critical"), "电量极低");
+        assert_eq!(rust_i18n::t!("Battery level unavailable"), "电量未知");
+        assert_eq!(
+            battery_value_label(&BatteryInfo {
+                percentage: None,
+                level: BatteryLevel::Good,
+                status: BatteryStatus::Discharging,
+            }),
+            "电量充足"
+        );
+        assert_eq!(
+            battery_value_label(&BatteryInfo {
+                percentage: None,
+                level: BatteryLevel::Unknown,
+                status: BatteryStatus::Charging,
+            }),
+            "充电中"
+        );
+        assert_eq!(
+            battery_value_label(&BatteryInfo {
+                percentage: Some(80),
+                level: BatteryLevel::Good,
+                status: BatteryStatus::Discharging,
+            }),
+            "80%"
+        );
         assert_ne!(
             rust_i18n::t!(BLURB),
             BLURB,

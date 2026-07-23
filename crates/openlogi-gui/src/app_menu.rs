@@ -13,6 +13,7 @@ use gpui::{App, KeyBinding, Menu, MenuItem, OsAction, actions};
 use openlogi_core::brand::{HELP_URL, RELEASES_URL, REPO_URL};
 use url::Url;
 
+use crate::i18n::battery_value_label;
 use crate::state::AppState;
 
 actions!(
@@ -220,7 +221,9 @@ fn device_menu_items(cx: &App) -> Vec<MenuItem> {
         Some(state) if !state.device_list.is_empty() => {
             for record in &state.device_list {
                 let title = match &record.battery {
-                    Some(battery) => format!("{} · {}%", record.display_name, battery.percentage),
+                    Some(battery) => {
+                        format!("{} · {}", record.display_name, battery_value_label(battery))
+                    }
                     None => record.display_name.clone(),
                 };
                 items.push(MenuItem::action(title, OpenSettings).disabled(true));

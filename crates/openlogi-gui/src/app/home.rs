@@ -24,6 +24,7 @@ use super::status::{loading_body, notice_body};
 use super::widgets::{add_device_button, kind_label, settings_button};
 use crate::asset::GlowGeometry;
 use crate::components::carousel::Carousel;
+use crate::i18n::battery_value_label;
 use crate::state::{AppState, DeviceRecord};
 use crate::theme::{self, HEADER_H, Palette, SelectableStyle as _, Typography as _};
 
@@ -315,8 +316,8 @@ fn status_dot(online: bool) -> AnyElement {
     .into_any_element()
 }
 
-/// Battery readout for a gallery card: a charge/level glyph plus the
-/// percentage, in the muted metadata style.
+/// Battery readout for a gallery card: a charge/level glyph plus an exact
+/// percentage or the device's coarse level, in the muted metadata style.
 fn battery_view(b: &BatteryInfo, pal: Palette) -> AnyElement {
     h_flex()
         .gap_1()
@@ -324,7 +325,7 @@ fn battery_view(b: &BatteryInfo, pal: Palette) -> AnyElement {
         .text_caption()
         .text_color(pal.text_muted)
         .child(Icon::new(battery_icon(b)).size_3())
-        .child(format!("{}%", b.percentage))
+        .child(battery_value_label(b))
         .into_any_element()
 }
 

@@ -369,10 +369,10 @@ impl AppState {
         // Compare more than config_key: a device can reconnect on a new HID++
         // index while keeping its physical config key, and the fresh route must
         // replace the stale one so reads/writes don't target a dead index.
-        // `online` and `capabilities` are compared too, so a device waking up or
-        // a probe that resolves its feature table on a stable route still
-        // refreshes the carousel (and its config panels) instead of being
-        // swallowed by this guard.
+        // `online`, `capabilities`, and `battery` are compared too, so a device
+        // waking up, resolving its feature table, or reporting a new charge
+        // state refreshes the corresponding UI instead of being swallowed by
+        // this guard.
         let unchanged = merged_list.len() == self.device_list.len()
             && merged_list
                 .iter()
@@ -382,6 +382,7 @@ impl AppState {
                         && a.route == b.route
                         && a.online == b.online
                         && a.capabilities == b.capabilities
+                        && a.battery == b.battery
                 });
         if unchanged && !force {
             return false;
@@ -1282,11 +1283,62 @@ impl Global for AppState {}
 #[cfg(test)]
 mod tests {
     use openlogi_core::config::{Config, DeviceIdentity, ScrollResolution};
-    use openlogi_core::device::{Capabilities, DeviceKind, DeviceModelInfo, DeviceTransports};
+    use openlogi_core::device::{
+        BatteryInfo, BatteryLevel, BatteryStatus, Capabilities, DeviceInventory, DeviceKind,
+        DeviceModelInfo, DeviceTransports, PairedDevice, ReceiverInfo,
+    };
 
     use crate::asset::AssetResolver;
 
     use super::{AppState, set_scroll_resolution_if_supported};
+
+    #[test]
+    fn battery_only_inventory_change_refreshes_device_record() {
+        let inventory = |status| DeviceInventory {
+            receiver: ReceiverInfo {
+                name: "Unifying Receiver".into(),
+                vendor_id: 0x046d,
+                product_id: 0xc52b,
+                unique_id: Some("D0289DB2".into()),
+            },
+            paired: vec![PairedDevice {
+                slot: 1,
+                codename: Some("MX Master 3".into()),
+                wpid: Some(0x4082),
+                kind: DeviceKind::Mouse,
+                online: true,
+                battery: Some(BatteryInfo {
+                    percentage: None,
+                    level: BatteryLevel::Full,
+                    status,
+                }),
+                model_info: None,
+                capabilities: None,
+            }],
+        };
+        let cache = AssetResolver::new();
+        let (commands, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = AppState::with_runtime(
+            Config::default(),
+            &[inventory(BatteryStatus::Charging)],
+            &cache,
+            commands,
+        );
+
+        assert!(
+            state.refresh_inventories(&[inventory(BatteryStatus::Discharging)], &cache, false,)
+        );
+        assert_eq!(
+            state
+                .current_record()
+                .and_then(|record| record.battery.as_ref()),
+            Some(&BatteryInfo {
+                percentage: None,
+                level: BatteryLevel::Full,
+                status: BatteryStatus::Discharging,
+            })
+        );
+    }
 
     #[test]
     fn known_offline_device_is_an_asset_sync_target() {
