@@ -261,7 +261,7 @@ impl Orchestrator {
             let Some(device) = matching.and_then(|index| inventory.paired.get_mut(index)) else {
                 continue;
             };
-            if device.battery.as_ref() == Some(&battery) {
+            if !device.online || device.battery.as_ref() == Some(&battery) {
                 return false;
             }
             device.battery = Some(battery);
@@ -940,5 +940,20 @@ mod tests {
         assert!(!orch.update_battery(&route, charging_battery()));
         orch.refresh_inventory(&[battery_inventory("receiver-b", 1)]);
         assert!(!orch.update_battery(&route, charging_battery()));
+    }
+
+    #[test]
+    fn battery_update_ignores_offline_device() {
+        let route = DeviceRoute::Unifying {
+            receiver_uid: "receiver-a".to_string(),
+            slot: 1,
+        };
+        let mut inventory = battery_inventory("receiver-a", 1);
+        inventory.paired[0].online = false;
+        let mut orch = Orchestrator::new(Config::default());
+        orch.refresh_inventory(&[inventory]);
+
+        assert!(!orch.update_battery(&route, charging_battery()));
+        assert_eq!(orch.inventory()[0].paired[0].battery, None);
     }
 }

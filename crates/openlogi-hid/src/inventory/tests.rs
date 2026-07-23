@@ -5,7 +5,8 @@ use hidpp::{
     feature::{CreatableFeature as _, unified_battery::UnifiedBatteryFeature},
 };
 use openlogi_core::device::{
-    Capabilities, DeviceInventory, DeviceKind, PairedDevice, ReceiverInfo,
+    BatteryInfo, BatteryLevel, BatteryStatus, Capabilities, DeviceInventory, DeviceKind,
+    PairedDevice, ReceiverInfo,
 };
 use tokio::sync::{Mutex, mpsc};
 
@@ -99,6 +100,11 @@ fn cached_probe_is_reused_until_refresh_ticks() {
 #[test]
 fn unifying_cached_features_do_not_override_current_liveness() {
     let probe = ProbedFeatures {
+        battery: Some(BatteryInfo {
+            percentage: None,
+            level: BatteryLevel::Full,
+            status: BatteryStatus::Charging,
+        }),
         capabilities: Some(Capabilities::default()),
         ..ProbedFeatures::default()
     };
@@ -119,6 +125,10 @@ fn unifying_cached_features_do_not_override_current_liveness() {
     assert!(
         device.capabilities.is_some(),
         "cached immutable features remain available while offline"
+    );
+    assert_eq!(
+        device.battery, None,
+        "an offline route must not expose its last cached battery state"
     );
 }
 

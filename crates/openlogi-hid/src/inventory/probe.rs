@@ -431,7 +431,7 @@ async fn walk_bolt_slot(
         // offline fallback.
         kind: resolve_device_kind(probe.kind, register_kind),
         online,
-        battery: probe.battery,
+        battery: online.then_some(probe.battery).flatten(),
         model_info: probe.model_info,
         capabilities: probe.capabilities,
     };
@@ -710,7 +710,7 @@ pub(super) fn assemble_unifying_device(
         wpid: Some(wpid),
         kind: resolve_device_kind(probe.kind, register_kind),
         online,
-        battery: probe.battery,
+        battery: online.then_some(probe.battery).flatten(),
         model_info: probe.model_info,
         capabilities: probe.capabilities,
     }
