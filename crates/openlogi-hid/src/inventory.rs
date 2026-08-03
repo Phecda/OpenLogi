@@ -386,8 +386,14 @@ impl Enumerator {
             all_healthy &= probe.healthy;
             outcomes.extend(probe.outcomes);
             let settled = self.ledger.settle(&node, probe.healthy, probe.inventory);
-            if settled.evict_channel && self.channels.remove(&node).is_some() {
-                warn!("node probe keeps failing — dropping its channel to reopen next tick");
+            if settled.evict_channel
+                && let Some(open) = self.channels.remove(&node)
+            {
+                // The capture session or another subsystem may still hold this
+                // shared channel. Mark it unusable before dropping our Arc so
+                // those owners exit and the process-wide pool opens a new one.
+                open.channel.invalidate();
+                warn!("node probe keeps failing — invalidating its channel to reopen next tick");
             }
             inventories.extend(settled.inventory);
         }

@@ -8,20 +8,21 @@
 //! collections carry both reports; BLE-direct collections are long-only, and the
 //! `hidpp` channel up-converts outgoing short messages to long for them.
 
+use std::collections::HashMap;
 #[cfg(not(target_os = "windows"))]
 use std::error::Error;
+use std::hash::Hash;
 #[cfg(not(target_os = "windows"))]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Weak};
 
 #[cfg(not(target_os = "windows"))]
 use async_hid::{AsyncHidRead, AsyncHidWrite, DeviceReader};
-use async_hid::{DeviceInfo, DeviceWriter, HidBackend};
+use async_hid::{DeviceId, DeviceInfo, DeviceWriter, HidBackend};
 use futures_lite::StreamExt as _;
 use hidpp::channel::HidppChannel;
 #[cfg(not(target_os = "windows"))]
 use hidpp::{async_trait, channel::RawHidChannel};
-#[cfg(not(target_os = "windows"))]
 use tokio::sync::Mutex;
 use tracing::debug;
 
@@ -106,6 +107,46 @@ fn is_long_only_collection(usage_page: u16, usage_id: u16) -> bool {
 /// `enumerate` only reads a snapshot (`IOHIDManagerCopyDevices`), and sharing a
 /// single long-lived `IOHIDManager` across threads is the model hidapi uses too.
 static HID_BACKEND: LazyLock<HidBackend> = LazyLock::new(HidBackend::default);
+
+/// Process-wide weak references to open HID++ channels, keyed by OS node.
+///
+/// Every route resolver goes through [`open_hidpp_channel`]. Sharing here keeps
+/// inventory, control capture, IPC reads/writes, and pairing from opening the
+/// same node independently and splitting its input-report stream. Weak entries
+/// deliberately do not own a channel: the inventory/capture users still define
+/// its lifetime, so dropping an evicted or disconnected channel closes it as
+/// before.
+static HIDPP_CHANNELS: LazyLock<Mutex<HidppChannelCache<DeviceId>>> =
+    LazyLock::new(|| Mutex::new(HidppChannelCache::default()));
+
+/// Weak channel lookup, generic over the key so its lifetime rules can be
+/// tested without constructing a platform-specific [`DeviceId`].
+struct HidppChannelCache<K> {
+    channels: HashMap<K, Weak<HidppChannel>>,
+}
+
+impl<K> Default for HidppChannelCache<K> {
+    fn default() -> Self {
+        Self {
+            channels: HashMap::new(),
+        }
+    }
+}
+
+impl<K: Eq + Hash> HidppChannelCache<K> {
+    fn live(&mut self, key: &K) -> Option<Arc<HidppChannel>> {
+        self.channels
+            .retain(|_, channel| channel.strong_count() != 0);
+        self.channels
+            .get(key)
+            .and_then(Weak::upgrade)
+            .filter(|channel| channel.is_connected())
+    }
+
+    fn remember(&mut self, key: K, channel: &Arc<HidppChannel>) {
+        self.channels.insert(key, Arc::downgrade(channel));
+    }
+}
 
 /// The process-wide HID backend shared by enumeration and hotplug watching.
 pub(crate) fn hid_backend() -> &'static HidBackend {
@@ -224,43 +265,52 @@ pub(crate) async fn open_hidpp_channel(
     // `Device: Deref<Target = DeviceInfo>` — clone the deref'd value so we can
     // keep using `dev` (which `to_device_info` would consume).
     let info: DeviceInfo = (*dev).clone();
+    // Hold the pool lock through a real open. Opens are infrequent and this
+    // makes the check-and-open atomic, so concurrent subsystems cannot both
+    // miss the weak entry and create competing readers for one HID node.
+    let mut channels = HIDPP_CHANNELS.lock().await;
+    if let Some(channel) = channels.live(&info.id) {
+        debug!(name = %info.name, "reusing open HID++ channel");
+        return Ok(Some((info, channel)));
+    }
+
     // On Windows the short (0x10) and long (0x11) HID++ report collections are
     // exposed as separate device interfaces, so the channel must open both and
     // route by report id (see WindowsHidppChannel). Elsewhere one node carries
     // both reports (or is long-only), handled by AsyncHidChannel.
     #[cfg(target_os = "windows")]
-    {
+    let channel = {
         let raw = WindowsHidppChannel::open(dev, info.clone()).await?;
-        let channel = match HidppChannel::from_raw_channel(raw).await {
+        match HidppChannel::from_raw_channel(raw).await {
             Ok(c) => Arc::new(c),
             Err(e) => {
                 debug!(name = %info.name, error = ?e, "not a HID++ channel");
                 return Ok(None);
             }
-        };
-        Ok(Some((info, channel)))
-    }
+        }
+    };
 
     #[cfg(not(target_os = "windows"))]
-    {
+    let channel = {
         let (reader, writer) = dev.open().await?;
         // BLE-direct devices expose only the long HID++ report; flag the channel so
         // it advertises short-unsupported and the `hidpp` channel up-converts shorts.
         let long_only = is_long_only_collection(info.usage_page, info.usage_id);
         let raw = AsyncHidChannel::new(reader, writer, info.clone(), long_only);
-        let channel = match HidppChannel::from_raw_channel(raw).await {
+        match HidppChannel::from_raw_channel(raw).await {
             Ok(c) => Arc::new(c),
             Err(e) => {
                 debug!(name = %info.name, error = ?e, "not a HID++ channel");
                 return Ok(None);
             }
-        };
-        // Logged once per actual open. The inventory watcher reuses channels across
-        // ticks, so a steadily-connected device should log this on first sight (and
-        // on reconnect) only — not every ~2s tick.
-        debug!(name = %info.name, vid = format_args!("{:04x}", info.vendor_id), "opened HID++ channel");
-        Ok(Some((info, channel)))
-    }
+        }
+    };
+
+    channels.remember(info.id.clone(), &channel);
+    // Logged once per actual open. A steadily-connected node should reach this
+    // only on first sight and after a real disconnect, not once per subsystem.
+    debug!(name = %info.name, vid = format_args!("{:04x}", info.vendor_id), "opened HID++ channel");
+    Ok(Some((info, channel)))
 }
 
 #[cfg(not(target_os = "windows"))]

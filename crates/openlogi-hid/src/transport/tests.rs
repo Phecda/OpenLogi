@@ -1,4 +1,102 @@
 use super::*;
+use std::error::Error;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use hidpp::channel::RawHidChannel;
+
+struct PoolRawChannel {
+    connected: Arc<AtomicBool>,
+}
+
+#[hidpp::async_trait]
+impl RawHidChannel for PoolRawChannel {
+    fn vendor_id(&self) -> u16 {
+        LOGITECH_VID
+    }
+
+    fn product_id(&self) -> u16 {
+        0xb023
+    }
+
+    async fn write_report(&self, src: &[u8]) -> Result<usize, Box<dyn Error + Send + Sync>> {
+        Ok(src.len())
+    }
+
+    async fn read_report(&self, _buf: &mut [u8]) -> Result<usize, Box<dyn Error + Send + Sync>> {
+        std::future::pending().await
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
+    fn supports_short_long_hidpp(&self) -> Option<(bool, bool)> {
+        Some((false, true))
+    }
+
+    async fn get_report_descriptor(
+        &self,
+        _buf: &mut [u8],
+    ) -> Result<usize, Box<dyn Error + Send + Sync>> {
+        unreachable!("mock declares HID++ support")
+    }
+}
+
+async fn pool_channel(connected: Arc<AtomicBool>) -> Arc<HidppChannel> {
+    Arc::new(
+        HidppChannel::from_raw_channel(PoolRawChannel { connected })
+            .await
+            .unwrap_or_else(|e| panic!("mock HID++ channel should open: {e}")),
+    )
+}
+
+#[tokio::test]
+async fn channel_cache_reuses_one_live_channel_per_node() {
+    let channel = pool_channel(Arc::new(AtomicBool::new(true))).await;
+    let mut cache = HidppChannelCache::default();
+    cache.remember(7, &channel);
+
+    let reused = cache
+        .live(&7)
+        .unwrap_or_else(|| panic!("live channel should remain reusable"));
+
+    assert!(Arc::ptr_eq(&channel, &reused));
+}
+
+#[tokio::test]
+async fn channel_cache_rejects_a_disconnected_channel() {
+    let connected = Arc::new(AtomicBool::new(true));
+    let channel = pool_channel(Arc::clone(&connected)).await;
+    let mut cache = HidppChannelCache::default();
+    cache.remember(7, &channel);
+
+    connected.store(false, Ordering::Release);
+
+    assert!(cache.live(&7).is_none());
+}
+
+#[tokio::test]
+async fn channel_cache_rejects_an_invalidated_channel() {
+    let channel = pool_channel(Arc::new(AtomicBool::new(true))).await;
+    let mut cache = HidppChannelCache::default();
+    cache.remember(7, &channel);
+
+    channel.invalidate();
+
+    assert!(cache.live(&7).is_none());
+}
+
+#[tokio::test]
+async fn channel_cache_does_not_keep_an_unowned_channel_alive() {
+    let channel = pool_channel(Arc::new(AtomicBool::new(true))).await;
+    let mut cache = HidppChannelCache::default();
+    cache.remember(7, &channel);
+
+    drop(channel);
+
+    assert!(cache.live(&7).is_none());
+    assert!(cache.channels.is_empty());
+}
 
 #[test]
 fn matches_usb_ble_and_keyboard_hidpp_collections() {

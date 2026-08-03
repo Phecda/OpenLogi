@@ -21,6 +21,7 @@ workspace = true
 
 [workspace]
 resolver = "3"
+exclude = ["vendor/async-hid"]
 members = [
     "crates/openlogi-core",
     "crates/openlogi-inject",
@@ -46,7 +47,9 @@ description = "Lightweight, local-first alternative to Logitech Options+ for HID
 
 [workspace.dependencies]
 hidpp = { package = "openlogi-hidpp", path = "crates/openlogi-hidpp", version = "0.6.22" }
-async-hid = "0.5.2"
+# Vendored until upstream exposes the macOS report callback timeout. Its 250 ms
+# default is too short for Bluetooth HID++ devices; see vendor/async-hid.
+async-hid = { path = "vendor/async-hid", version = "0.5.3" }
 # Cross-platform local IPC for the agent <-> GUI tarpc transport: a Unix-domain
 # socket on Unix, a named pipe on Windows. The `tokio` feature gives the async
 # Stream/Listener used by serde_transport.

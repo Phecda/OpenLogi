@@ -1,0 +1,69 @@
+# Vendored from https://github.com/sidit77/async-hid at
+# 1d3443591f4a17d2c4ac75b4ce63edfafab03daf (v0.5.3). OpenLogi carries one
+# macOS-specific change in read_writer.rs; keep the rest close to upstream.
+[package]
+name = "async-hid"
+version = "0.5.3"
+authors = [ "sidit77" ]
+repository = "https://github.com/sidit77/async-hid"
+description = "A async library for interacting with HID devices"
+readme = "README.md"
+license = "MIT"
+keywords = ["hid", "usb", "async", "wrapper"]
+categories = ["api-bindings", "asynchronous", "hardware-support"]
+edition = "2021"
+
+[features]
+default = ["async-io", "win32"]
+tokio = ["dep:tokio"]
+async-io = ["dep:async-io"]
+win32 = ["dep:atomic-waker", "dep:crossbeam-queue"]
+winrt = ["dep:windows-future", "dep:once_cell", "dep:async-channel"]
+
+[dependencies]
+log = "0.4"
+futures-lite = "2.5"
+static_assertions = "1.1"
+
+[target."cfg(target_os = \"windows\")".dependencies]
+async-channel = { version = "2.3.1", optional = true }
+once_cell = { version = "1.21.3", optional = true }
+atomic-waker = { version = "1.1.2", optional = true }
+crossbeam-queue = { version = "0.3.12", optional = true }
+windows-future = { version = "0.2.0", optional = true }
+windows = { version = "0.61.1", features = [
+    "Devices_Enumeration",
+    "Devices_HumanInterfaceDevice",
+    "Foundation",
+    "Foundation_Collections",
+    "Storage",
+    "Storage_Streams",
+    "Win32_System_WinRT",
+
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_Devices_DeviceAndDriverInstallation"
+]}
+
+[target."cfg(target_os = \"linux\")".dependencies]
+tokio = { version = "1", features = ["net"], optional = true }
+async-io = { version = "2", optional = true }
+nix = { version = "0.29.0", features = ["fs", "ioctl", "socket"] }
+
+[target."cfg(target_os = \"macos\")".dependencies]
+objc2-io-kit = "0.3.2"
+objc2-core-foundation = "0.3.2"
+dispatch2 = "0.3.0"
+block2 = "0.6.1"
+atomic-waker = "1.1.2"
+crossbeam-queue = "0.3.12"
+
+[dev-dependencies]
+simple_logger = "5"
+futures-lite = "2.5.0"
+pollster = { version = "0.4.0", features = ["macro"] }
+async-io = "2.4.0"

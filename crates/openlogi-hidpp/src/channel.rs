@@ -272,6 +272,10 @@ pub struct HidppChannel {
     /// The underlying raw HID channel.
     raw_channel: Arc<dyn RawHidChannel>,
 
+    /// Whether an owner has rejected this channel after repeated protocol
+    /// failures even though the raw transport did not report a disconnect.
+    invalidated: AtomicBool,
+
     /// Whether to rotate the [`Self::software_id`].
     rotate_software_id: AtomicBool,
 
@@ -401,6 +405,7 @@ impl HidppChannel {
             vendor_id: raw_channel_rc.vendor_id(),
             product_id: raw_channel_rc.product_id(),
             raw_channel: raw_channel_rc,
+            invalidated: AtomicBool::new(false),
             rotate_software_id: AtomicBool::new(false),
             software_id: AtomicU8::new(0x01),
             pending_messages: pending_messages_rc,
@@ -411,9 +416,19 @@ impl HidppChannel {
         })
     }
 
-    /// Whether the underlying HID transport still reports a live connection.
+    /// Whether this channel is still usable.
     pub fn is_connected(&self) -> bool {
-        self.raw_channel.is_connected()
+        !self.invalidated.load(Ordering::Acquire) && self.raw_channel.is_connected()
+    }
+
+    /// Reject this channel after repeated protocol failures.
+    ///
+    /// Some HID transports keep an open handle marked connected after the
+    /// device has stopped answering. Invalidating lets every shared owner
+    /// observe the failure and release the stale handle so a new channel can
+    /// be opened.
+    pub fn invalidate(&self) {
+        self.invalidated.store(true, Ordering::Release);
     }
 
     /// Sets the software ID that should be returned by the next call to
@@ -750,6 +765,18 @@ mod tests {
             assert_eq!(actual, response);
             assert_eq!(handle.written_reports().len(), 1);
             assert_pending_empty(&channel);
+        });
+    }
+
+    #[test]
+    fn invalidated_channel_reports_disconnected() {
+        futures::executor::block_on(async {
+            let (raw, _handle) = MockRawHidChannel::new();
+            let channel = HidppChannel::from_raw_channel(raw).await.unwrap();
+
+            assert!(channel.is_connected());
+            channel.invalidate();
+            assert!(!channel.is_connected());
         });
     }
 
