@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 
 use gpui::{App, Global};
 use openlogi_core::config::{
-    AppSettings, Appearance, AssetSourcePreference, Config, DeviceIdentity, Lighting,
+    AppSettings, Appearance, AssetSourcePreference, Config, ConfigError, DeviceIdentity, Lighting,
 };
 use openlogi_core::device::{DeviceInventory, DeviceModelInfo};
 use openlogi_hid::{
@@ -89,6 +89,23 @@ pub enum AgentLink {
 /// disappear mid-interaction.
 const INVENTORY_MISS_GRACE: u8 = 2;
 
+#[derive(Clone, Copy)]
+enum ConfigPersistence {
+    Disk,
+    #[cfg(test)]
+    MemoryOnly,
+}
+
+impl ConfigPersistence {
+    fn save(self, config: &Config) -> Result<(), ConfigError> {
+        match self {
+            Self::Disk => config.save_atomic(),
+            #[cfg(test)]
+            Self::MemoryOnly => Ok(()),
+        }
+    }
+}
+
 pub struct AppState {
     /// Index into [`Self::device_list`] of the currently visible device. May
     /// be out of bounds briefly while inventories re-enumerate; views must
@@ -147,6 +164,9 @@ pub struct AppState {
     /// [`Self::set_current_device`] so restarts preserve user bindings and
     /// the last-selected device.
     config: Config,
+    /// Production writes to the user's config; state tests use memory-only
+    /// persistence so they can never mutate a developer's real file.
+    config_persistence: ConfigPersistence,
     /// Sender to the IPC client thread. The agent owns the hook + all device
     /// I/O, so binding / setting writes persist to `config.toml` and then send
     /// [`Command::ReloadConfig`](crate::ipc_client::Command) for the agent to
@@ -180,14 +200,46 @@ impl AppState {
     /// matches one of the paired devices; otherwise it falls back to index 0.
     #[must_use]
     pub fn with_runtime(
-        mut config: Config,
+        config: Config,
         inventories: &[DeviceInventory],
         cache: &AssetResolver,
         ipc_commands: mpsc::UnboundedSender<crate::ipc_client::Command>,
     ) -> Self {
+        Self::with_runtime_persistence(
+            config,
+            inventories,
+            cache,
+            ipc_commands,
+            ConfigPersistence::Disk,
+        )
+    }
+
+    #[cfg(test)]
+    fn with_runtime_for_test(
+        config: Config,
+        inventories: &[DeviceInventory],
+        cache: &AssetResolver,
+        ipc_commands: mpsc::UnboundedSender<crate::ipc_client::Command>,
+    ) -> Self {
+        Self::with_runtime_persistence(
+            config,
+            inventories,
+            cache,
+            ipc_commands,
+            ConfigPersistence::MemoryOnly,
+        )
+    }
+
+    fn with_runtime_persistence(
+        mut config: Config,
+        inventories: &[DeviceInventory],
+        cache: &AssetResolver,
+        ipc_commands: mpsc::UnboundedSender<crate::ipc_client::Command>,
+        config_persistence: ConfigPersistence,
+    ) -> Self {
         let device_list = build_device_list(inventories, cache, &config);
         // Record any device probed at launch so it survives the next cold start.
-        persist_identities(&mut config, &device_list);
+        persist_identities(&mut config, &device_list, config_persistence);
         let current_device = pick_initial_device(&device_list, config.selected_device());
         let mut state = Self {
             current_device,
@@ -208,6 +260,7 @@ impl AppState {
             smartshift_write_status: BTreeMap::new(),
             device_list,
             config,
+            config_persistence,
             ipc_commands,
             last_inventory: Vec::new(),
             #[cfg(all(target_os = "macos", debug_assertions))]
@@ -237,7 +290,7 @@ impl AppState {
     /// next reconnect or wake. Skipping the reload keeps the agent on whatever
     /// it already runs; the GUI keeps the new value in memory either way.
     fn persist_and_reload(&self, what: &str) {
-        if let Err(e) = self.config.save_atomic() {
+        if let Err(e) = self.config_persistence.save(&self.config) {
             warn!(error = %e, what, "could not persist to config.toml — agent reload skipped");
             return;
         }
@@ -391,7 +444,7 @@ impl AppState {
         // Capture any newly-probed identity before the unchanged-check can early
         // out: a device whose capabilities just resolved keeps the same
         // config_key + route, so that guard would otherwise skip the write.
-        persist_identities(&mut self.config, &merged_list);
+        persist_identities(&mut self.config, &merged_list, self.config_persistence);
         // Compare more than config_key: a device can reconnect on a new HID++
         // index while keeping its physical config key, and the fresh route must
         // replace the stale one so reads/writes don't target a dead index.
@@ -1181,7 +1234,7 @@ impl AppState {
             return;
         }
         self.config.app_settings.check_for_updates = enabled;
-        if let Err(e) = self.config.save_atomic() {
+        if let Err(e) = self.config_persistence.save(&self.config) {
             warn!(error = %e, "could not persist update-check setting");
         }
     }
@@ -1195,7 +1248,7 @@ impl AppState {
             return;
         }
         self.config.app_settings.auto_install_updates = enabled;
-        if let Err(e) = self.config.save_atomic() {
+        if let Err(e) = self.config_persistence.save(&self.config) {
             warn!(error = %e, "could not persist auto-install setting");
         }
     }
@@ -1208,7 +1261,7 @@ impl AppState {
             return;
         }
         self.config.app_settings.appearance = appearance;
-        if let Err(e) = self.config.save_atomic() {
+        if let Err(e) = self.config_persistence.save(&self.config) {
             warn!(error = %e, "could not persist appearance setting");
         }
     }
@@ -1225,7 +1278,7 @@ impl AppState {
             return;
         }
         *slot = name;
-        if let Err(e) = self.config.save_atomic() {
+        if let Err(e) = self.config_persistence.save(&self.config) {
             warn!(error = %e, "could not persist theme setting");
         }
     }
@@ -1237,7 +1290,7 @@ impl AppState {
             return;
         }
         self.config.app_settings.ui_radius = radius;
-        if let Err(e) = self.config.save_atomic() {
+        if let Err(e) = self.config_persistence.save(&self.config) {
             warn!(error = %e, "could not persist UI radius setting");
         }
     }
@@ -1262,7 +1315,7 @@ impl AppState {
             return;
         }
         self.config.app_settings.auto_download_assets = enabled;
-        if let Err(e) = self.config.save_atomic() {
+        if let Err(e) = self.config_persistence.save(&self.config) {
             warn!(error = %e, "could not persist auto-download-assets setting");
         }
     }
@@ -1275,7 +1328,7 @@ impl AppState {
             return;
         }
         self.config.app_settings.asset_source = source;
-        if let Err(e) = self.config.save_atomic() {
+        if let Err(e) = self.config_persistence.save(&self.config) {
             warn!(error = %e, "could not persist asset-source setting");
         }
     }
@@ -1286,7 +1339,7 @@ impl AppState {
     pub fn record_update_consent(&mut self, enabled: bool) {
         self.config.app_settings.check_for_updates = enabled;
         self.config.app_settings.update_prompt_seen = true;
-        if let Err(e) = self.config.save_atomic() {
+        if let Err(e) = self.config_persistence.save(&self.config) {
             warn!(error = %e, "could not persist update-check consent");
         }
     }
@@ -1308,7 +1361,7 @@ impl AppState {
             return;
         }
         self.config.app_settings.language = language;
-        if let Err(e) = self.config.save_atomic() {
+        if let Err(e) = self.config_persistence.save(&self.config) {
             warn!(error = %e, "could not persist language setting");
         }
         crate::i18n::activate(self.config.app_settings.language.as_deref());
@@ -1449,7 +1502,7 @@ impl AppState {
 /// or carried-forward `None` — so a placeholder never persists empty panels.
 /// The change-guard keeps quiet inventory ticks off the disk; the agent does
 /// not consume identities, so no `ReloadConfig` is sent.
-fn persist_identities(config: &mut Config, list: &[DeviceRecord]) {
+fn persist_identities(config: &mut Config, list: &[DeviceRecord], persistence: ConfigPersistence) {
     let mut changed = false;
     for record in list {
         if !record.online {
@@ -1477,7 +1530,7 @@ fn persist_identities(config: &mut Config, list: &[DeviceRecord]) {
             changed = true;
         }
     }
-    if changed && let Err(e) = config.save_atomic() {
+    if changed && let Err(e) = persistence.save(config) {
         warn!(error = %e, "could not persist device identities to config.toml");
     }
 }
@@ -1596,8 +1649,12 @@ mod tests {
         let cache = AssetResolver::new();
         let transient_inventory = direct_inventory([0; 4]);
         let (commands, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        let mut state =
-            AppState::with_runtime(Config::default(), &[transient_inventory], &cache, commands);
+        let mut state = AppState::with_runtime_for_test(
+            Config::default(),
+            &[transient_inventory],
+            &cache,
+            commands,
+        );
         let transient_key = "direct:046d:b023:unit:00000000";
 
         assert_eq!(state.device_list.len(), 1);
@@ -1624,7 +1681,7 @@ mod tests {
         // the card keeps its identity and takes the live volatile state.
         let cache = AssetResolver::new();
         let (commands, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        let mut state = AppState::with_runtime(
+        let mut state = AppState::with_runtime_for_test(
             Config::default(),
             &[direct_inventory([0xa3, 0x93, 0xca, 0xe0])],
             &cache,
@@ -1649,7 +1706,7 @@ mod tests {
         // snapshot: the transient record is probe noise, not a second device.
         let cache = AssetResolver::new();
         let (commands, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        let mut state = AppState::with_runtime(
+        let mut state = AppState::with_runtime_for_test(
             Config::default(),
             &[direct_inventory([0xa3, 0x93, 0xca, 0xe0])],
             &cache,
@@ -1680,7 +1737,7 @@ mod tests {
         // online and routed.
         let cache = AssetResolver::new();
         let (commands, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        let mut state = AppState::with_runtime(
+        let mut state = AppState::with_runtime_for_test(
             Config::default(),
             &[
                 direct_inventory([1, 1, 1, 1]),
@@ -1717,7 +1774,7 @@ mod tests {
         // so neither card may steal it.
         let cache = AssetResolver::new();
         let (commands, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        let mut state = AppState::with_runtime(
+        let mut state = AppState::with_runtime_for_test(
             Config::default(),
             &[
                 direct_inventory([1, 1, 1, 1]),
@@ -1746,7 +1803,7 @@ mod tests {
         config.set_lighting(transient_key, Lighting::default());
         assert!(config.lighting(transient_key).is_some());
         let (commands, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        let state = AppState::with_runtime(config, &[], &AssetResolver::new(), commands);
+        let state = AppState::with_runtime_for_test(config, &[], &AssetResolver::new(), commands);
 
         assert!(state.device_list.is_empty());
         assert!(state.lighting_for(transient_key).is_none());
@@ -1827,7 +1884,7 @@ mod tests {
             },
         );
         let (commands, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        let state = AppState::with_runtime(config, &[], &AssetResolver::new(), commands);
+        let state = AppState::with_runtime_for_test(config, &[], &AssetResolver::new(), commands);
 
         assert_eq!(
             state.asset_models(),

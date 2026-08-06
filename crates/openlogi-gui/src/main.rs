@@ -34,6 +34,7 @@ mod app_assets;
 mod app_menu;
 mod asset;
 mod components;
+mod config_recovery;
 mod data;
 mod diagnostics;
 mod i18n;
@@ -59,7 +60,7 @@ use gpui::{
 };
 use gpui_component::{ActiveTheme, Root};
 use openlogi_core::brand::DeeplinkCommand;
-use openlogi_core::config::Config;
+use openlogi_core::config::{AppSettings, Config};
 use openlogi_core::device::DeviceInventory;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -140,31 +141,15 @@ fn main() -> Result<()> {
     // when the first devices appear (see the `inventory_rx` arm).
     let inventories: Vec<DeviceInventory> = Vec::new();
 
-    let initial_config = Config::load_or_default().unwrap_or_else(|e| {
-        warn!(error = %e, "could not load config.toml; using defaults");
-        Config::default()
-    });
+    let initial_config = Config::load_or_default();
 
     // Resolve the UI locale before any menu or window is built so the first
-    // frame already renders in the right language.
-    i18n::apply(&initial_config.app_settings);
-
-    // The always-on agent owns the hook, the HID++ capture, and all device I/O.
-    // The GUI is a client: it polls inventory + status and forwards device
-    // commands over IPC. Started here so the first poll is already in flight.
-    let ipc_client::IpcClient {
-        updates: mut ipc_updates,
-        commands: ipc_commands,
-        pairing: mut ipc_pairing,
-    } = ipc_client::spawn(std::time::Duration::from_secs(2));
-
-    // Manual asset actions (Settings → Assets): Refresh / Clear cache. The
-    // sender is published as a global so the Settings window can drive the
-    // sync that lives on the main loop below; the loop keeps a second sender
-    // (`asset_ctrl_self_tx`) to re-issue a command it had to defer while a
-    // sync was in flight.
-    let (asset_ctrl_tx, mut asset_ctrl_rx) = tokio::sync::mpsc::unbounded_channel::<AssetCommand>();
-    let asset_ctrl_self_tx = asset_ctrl_tx.clone();
+    // frame already renders in the right language. An unreadable config cannot
+    // supply a trustworthy preference, so its recovery prompt follows the OS.
+    match &initial_config {
+        Ok(config) => i18n::apply(&config.app_settings),
+        Err(_) => i18n::apply(&AppSettings::default()),
+    }
 
     // `with_assets` registers the embedded app logo ([`app_assets`]) plus the
     // lucide SVGs that back `gpui_component::IconName`; without it `img()` /
@@ -189,56 +174,74 @@ fn main() -> Result<()> {
     });
 
     // Reopen the window when the app is relaunched with none open (dock click).
-    app.on_reopen(|cx| open_main_window(&[], cx));
+    app.on_reopen(|cx| {
+        if cx.has_global::<AppState>() {
+            open_main_window(&[], cx);
+        } else {
+            cx.activate(true);
+        }
+    });
 
     app.run(move |cx| {
         gpui_component::init(cx);
         theme::register_builtin_themes(cx);
-        app_menu::install(cx);
-
-        // Seed the Add Device window's initial state. Its buttons drive pairing
-        // through the agent over IPC; the agent's pairing long-poll feeds events
-        // back into this global via the select loop below.
-        cx.set_global(windows::add_device::PairingUi::Idle);
-
-        // The Settings → Assets buttons drive the asset sync (which lives on
-        // the select loop below) through this global.
-        cx.set_global(AssetControl(asset_ctrl_tx));
-
-        // Publish the shared updater and, if the user opted in, run one
-        // check on launch. Done before `initial_config` is moved into the
-        // window-opening task below.
-        platform::updater::install(cx, &initial_config.app_settings);
-
-        // On-demand GUI: quit when the last window closes. The agent stays
-        // resident and keeps remapping (and hosts the menu-bar item from which
-        // the GUI is reopened), so nothing needs the GUI process to linger.
-        cx.on_window_closed(|cx, _| {
-            if cx.windows().is_empty() {
-                cx.quit();
-            }
-        })
-        .detach();
 
         cx.spawn(async move |cx| {
+            let initial_config = match initial_config {
+                Ok(config) => config,
+                Err(error) => {
+                    let Some(config) = config_recovery::resolve(error, cx).await else {
+                        cx.update(|cx| cx.quit());
+                        return;
+                    };
+                    config
+                }
+            };
+
+            // Do not spawn or connect to the agent until config loading has
+            // succeeded or the user has explicitly completed recovery.
+            let ipc_client::IpcClient {
+                updates: mut ipc_updates,
+                commands: ipc_commands,
+                pairing: mut ipc_pairing,
+            } = ipc_client::spawn(std::time::Duration::from_secs(2));
+
+            // Manual asset actions (Settings → Assets): Refresh / Clear cache.
+            let (asset_ctrl_tx, mut asset_ctrl_rx) =
+                tokio::sync::mpsc::unbounded_channel::<AssetCommand>();
+            let asset_ctrl_self_tx = asset_ctrl_tx.clone();
+
             // Install the hook-shared AppState up front, then open the window at
             // launch; closing it leaves the app live in the menu bar.
             cx.update(|cx| {
-                if !cx.has_global::<AppState>() {
-                    let cache = asset::AssetResolver::new();
-                    cx.set_global(AppState::with_runtime(
-                        initial_config,
-                        &inventories,
-                        &cache,
-                        ipc_commands,
-                    ));
-                }
-                open_main_window(&inventories, cx);
-            });
+                app_menu::install(cx);
 
-            // First launch only: offer to opt in to the update check, since it
-            // defaults to off. Marked seen either way so it shows just once.
-            cx.update(|cx| {
+                // Seed the Add Device window's initial state. Its buttons drive
+                // pairing through the agent over IPC.
+                cx.set_global(windows::add_device::PairingUi::Idle);
+                cx.set_global(AssetControl(asset_ctrl_tx));
+                platform::updater::install(cx, &initial_config.app_settings);
+
+                // On-demand GUI: quit when the last window closes. The agent
+                // remains resident and keeps remapping.
+                cx.on_window_closed(|cx, _| {
+                    if cx.windows().is_empty() {
+                        cx.quit();
+                    }
+                })
+                .detach();
+
+                let cache = asset::AssetResolver::new();
+                cx.set_global(AppState::with_runtime(
+                    initial_config,
+                    &inventories,
+                    &cache,
+                    ipc_commands,
+                ));
+                open_main_window(&inventories, cx);
+
+                // First launch only: offer to opt in to the update check, since
+                // it defaults to off. Marked seen either way so it shows once.
                 let show = cx
                     .try_global::<AppState>()
                     .is_some_and(|s| !s.app_settings().update_prompt_seen);

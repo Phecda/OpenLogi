@@ -37,7 +37,7 @@ use openlogi_agent_core::{hook_runtime, watchers};
 use openlogi_core::config::Config;
 use openlogi_hook::Hook;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::server::AgentServer;
@@ -76,10 +76,13 @@ fn main() {
     // watches, so a losing duplicate can't restart anything.
     self_restart::spawn();
 
-    let config = Config::load_or_default().unwrap_or_else(|e| {
-        warn!(error = %e, "could not load config.toml; using defaults");
-        Config::default()
-    });
+    let config = match Config::load_or_default() {
+        Ok(config) => config,
+        Err(e) => {
+            error!(error = %e, "could not load config.toml; agent exiting without changing it");
+            return;
+        }
+    };
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
