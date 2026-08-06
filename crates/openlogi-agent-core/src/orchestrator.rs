@@ -280,39 +280,37 @@ impl Orchestrator {
     }
 
     /// Push the persisted volatile settings (lighting, sensor DPI, SmartShift,
-    /// native wheel mode) to one device, fire-and-forget on background threads.
-    /// Reuses the capture session's channel when it already points at the
-    /// device, like every other hardware write.
+    /// native wheel mode) to one device. Mouse settings run on one background
+    /// thread and one HID++ channel so concurrent multi-open of the same
+    /// receiver cannot cross-talk (#485); lighting stays a separate path
+    /// (keyboards / different feature).
     fn reapply_volatile_settings(&self, dev: &AgentDevice) {
         let Some(route) = dev.route.clone() else {
             return;
         };
         let key = &dev.config_key;
         let (resolution, inverted) = configured_wheel_mode(&self.config, dev);
-        crate::hardware::write_scroll_wheel_mode_in_background(
-            Some(&self.shared.capture_channel),
-            (resolution.is_some() || inverted.is_some()).then_some(route.clone()),
-            resolution,
-            inverted,
-        );
-        if let Some(lighting) = self.config.lighting(key).filter(|l| l.enabled) {
-            crate::hardware::set_lighting_in_background(Some(route.clone()), &lighting);
-        }
-        if let Some(dpi) = self.config.dpi(key) {
-            crate::hardware::write_dpi_in_background(
+        let dpi = self.config.dpi(key);
+        let smartshift = self
+            .config
+            .smartshift(key)
+            .map(|ss| crate::hardware::SmartShiftApply {
+                mode: ss.mode.into(),
+                auto_disengage: ss.auto_disengage,
+                tunable_torque: ss.tunable_torque,
+            });
+        if resolution.is_some() || inverted.is_some() || dpi.is_some() || smartshift.is_some() {
+            crate::hardware::reapply_mouse_volatile_in_background(
                 Some(&self.shared.capture_channel),
-                Some(route.clone()),
+                route.clone(),
+                resolution,
+                inverted,
                 dpi,
+                smartshift,
             );
         }
-        if let Some(smartshift) = self.config.smartshift(key) {
-            crate::hardware::write_smartshift_in_background(
-                Some(&self.shared.capture_channel),
-                Some(route),
-                smartshift.mode.into(),
-                smartshift.auto_disengage,
-                smartshift.tunable_torque,
-            );
+        if let Some(lighting) = self.config.lighting(key).filter(|l| l.enabled) {
+            crate::hardware::set_lighting_in_background(Some(route), &lighting);
         }
     }
 
@@ -604,11 +602,12 @@ mod tests {
     }
 
     fn direct_inventory(serial_number: Option<&str>, unit_id: [u8; 4]) -> DeviceInventory {
-        direct_inventory_state(0xb023, serial_number, unit_id, true)
+        direct_inventory_state(0xb023, 0xb034, serial_number, unit_id, true)
     }
 
     fn direct_inventory_state(
         product_id: u16,
+        model_id: u16,
         serial_number: Option<&str>,
         unit_id: [u8; 4],
         online: bool,
@@ -632,7 +631,7 @@ mod tests {
                     serial_number: serial_number.map(str::to_string),
                     unit_id,
                     transports: DeviceTransports::default(),
-                    model_ids: [product_id, 0, 0],
+                    model_ids: [model_id, 0, 0],
                     extended_model_id: 2,
                 }),
                 capabilities: Some(Capabilities::presumed_from_kind(DeviceKind::Mouse)),
@@ -700,14 +699,14 @@ mod tests {
         let mut orchestrator = Orchestrator::new(config);
 
         orchestrator.refresh_inventory(&[
-            direct_inventory_state(0xb023, None, [1, 0, 0, 0], true),
-            direct_inventory_state(0xb034, None, [2, 0, 0, 0], false),
+            direct_inventory_state(0xb023, 0xb023, None, [1, 0, 0, 0], true),
+            direct_inventory_state(0xb034, 0xb034, None, [2, 0, 0, 0], false),
         ]);
         assert_eq!(orchestrator.current_key(), Some(saved_key));
 
         orchestrator.refresh_inventory(&[
-            direct_inventory_state(0xb023, None, [1, 0, 0, 0], false),
-            direct_inventory_state(0xb034, None, [2, 0, 0, 0], true),
+            direct_inventory_state(0xb023, 0xb023, None, [1, 0, 0, 0], false),
+            direct_inventory_state(0xb034, 0xb034, None, [2, 0, 0, 0], true),
         ]);
         assert_eq!(orchestrator.current_key(), Some(other_key));
     }

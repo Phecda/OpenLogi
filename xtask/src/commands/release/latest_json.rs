@@ -30,8 +30,9 @@ pub(crate) struct Args {
     base_url: String,
     /// Also emit the per-arch Windows `.msi`/`.zip` entries. Off by default so
     /// the manifest can never reference objects the release workflow's R2
-    /// upload step doesn't ship: flip this in the same workflow change that
-    /// stops excluding the zip/msi from the `releases/` prefix (#347 PR 4).
+    /// upload step doesn't ship. The release workflow passes it and ships the
+    /// zip/msi to the `releases/` prefix; the Windows client downloads the
+    /// `.msi` and installs it via gpui-updater's staged msiexec flow.
     #[arg(long)]
     include_windows: bool,
 }

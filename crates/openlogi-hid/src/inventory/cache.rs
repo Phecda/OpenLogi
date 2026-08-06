@@ -90,11 +90,21 @@ pub(super) async fn probe_or_reuse(
         // `capabilities` is `Some` exactly when the feature-table walk succeeded;
         // only then is the probe worth caching.
         if fresh.capabilities.is_some() {
+            if let Some(c) = cached {
+                backfill_identity(&mut fresh, &c.probe);
+            }
             // The table walk succeeded and still exposes a battery endpoint,
             // so an empty reading is a transient status failure rather than a
             // removed feature. Preserve the last valid reading in that case.
             if fresh.battery.is_none() && battery_handle.is_some() {
                 fresh.battery = cached.and_then(|entry| entry.probe.battery.clone());
+            }
+            // A first-sight probe whose identity reads failed is served but not
+            // memoized: caching it would pin a wrong (all-zero unit or
+            // serial-less) config key for `REFRESH_TICKS` (#482). The next tick
+            // re-probes instead.
+            if fresh.identity_incomplete && cached.is_none() {
+                return (fresh, seen(id));
             }
             return match id {
                 Some(key) => {
@@ -134,5 +144,31 @@ pub(super) async fn probe_or_reuse(
             (c.probe.clone(), seen(id))
         }
         None => (ProbedFeatures::default(), seen(id)),
+    }
+}
+
+/// Carry immutable identity data the fresh probe failed to read forward from
+/// the cached probe, so a transient `DeviceInformation` failure can't flip the
+/// device's config key (#482). A probe whose identity reads all succeeded is
+/// returned untouched.
+pub(super) fn backfill_identity(fresh: &mut ProbedFeatures, cached: &ProbedFeatures) {
+    if fresh.kind.is_none() {
+        fresh.kind = cached.kind;
+    }
+    if !fresh.identity_incomplete {
+        return;
+    }
+    match (fresh.model_info.as_mut(), cached.model_info.as_ref()) {
+        (None, Some(previous)) => {
+            fresh.model_info = Some(previous.clone());
+            fresh.identity_incomplete = false;
+        }
+        (Some(now), Some(previous))
+            if now.serial_number.is_none() && previous.serial_number.is_some() =>
+        {
+            now.serial_number.clone_from(&previous.serial_number);
+            fresh.identity_incomplete = false;
+        }
+        _ => {}
     }
 }

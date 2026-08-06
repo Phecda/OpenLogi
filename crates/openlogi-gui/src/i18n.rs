@@ -212,6 +212,35 @@ mod tests {
         );
     }
 
+    fn assert_battery_labels() {
+        assert_eq!(rust_i18n::t!("Critical"), "电量极低");
+        assert_eq!(rust_i18n::t!("Battery level unavailable"), "电量未知");
+        assert_eq!(
+            battery_value_label(&BatteryInfo {
+                percentage: None,
+                level: BatteryLevel::Good,
+                status: BatteryStatus::Discharging,
+            }),
+            "电量充足"
+        );
+        assert_eq!(
+            battery_value_label(&BatteryInfo {
+                percentage: None,
+                level: BatteryLevel::Unknown,
+                status: BatteryStatus::Charging,
+            }),
+            "充电中"
+        );
+        assert_eq!(
+            battery_value_label(&BatteryInfo {
+                percentage: Some(80),
+                level: BatteryLevel::Good,
+                status: BatteryStatus::Discharging,
+            }),
+            "80%"
+        );
+    }
+
     /// End-to-end check that `locales/*.yml` loaded and the gettext-style
     /// English keys match — a typo'd key silently falls back to English, which
     /// this catches. All locale-dependent assertions live in this one test on
@@ -240,31 +269,22 @@ mod tests {
         assert_eq!(rust_i18n::t!("No devices connected"), "未连接设备"); // menu-bar device line
         assert_eq!(rust_i18n::t!("Lighting"), "灯光"); // keyboard lighting tab
         assert_eq!(rust_i18n::t!("BRIGHTNESS"), "亮度"); // lighting panel label
-        assert_eq!(rust_i18n::t!("Critical"), "电量极低");
-        assert_eq!(rust_i18n::t!("Battery level unavailable"), "电量未知");
+        assert_battery_labels();
         assert_eq!(
-            battery_value_label(&BatteryInfo {
-                percentage: None,
-                level: BatteryLevel::Good,
-                status: BatteryStatus::Discharging,
-            }),
-            "电量充足"
+            rust_i18n::t!("Automatically start OpenLogi when you log in to macOS."),
+            "登录 macOS 时自动启动 OpenLogi。"
         );
         assert_eq!(
-            battery_value_label(&BatteryInfo {
-                percentage: None,
-                level: BatteryLevel::Unknown,
-                status: BatteryStatus::Charging,
-            }),
-            "充电中"
+            rust_i18n::t!("No supported pairing-capable receiver was found."),
+            "未找到支持配对的接收器。"
         );
         assert_eq!(
-            battery_value_label(&BatteryInfo {
-                percentage: Some(80),
-                level: BatteryLevel::Good,
-                status: BatteryStatus::Discharging,
-            }),
-            "80%"
+            rust_i18n::t!("Device offline — DPI unavailable."),
+            "设备离线 —— DPI 不可用。"
+        );
+        assert_eq!(
+            rust_i18n::t!("This device does not report native HID++ scroll inversion support."),
+            "此设备未报告原生 HID++ 滚动反转支持。"
         );
         assert_ne!(
             rust_i18n::t!(BLURB),
@@ -303,6 +323,14 @@ mod tests {
         assert_eq!(rust_i18n::t!("Settings"), "設定");
         assert_eq!(rust_i18n::t!("Left Click"), "左鍵按一下");
         assert_eq!(rust_i18n::t!("Bind %{name}", name => "X"), "設定 X");
+        assert_eq!(
+            rust_i18n::t!("No supported pairing-capable receiver was found."),
+            "找不到支援配對的接收器。"
+        );
+        assert_eq!(
+            rust_i18n::t!("Device offline — DPI unavailable."),
+            "裝置離線 —— DPI 無法使用。"
+        );
         assert_ne!(
             rust_i18n::t!(BLURB),
             BLURB,

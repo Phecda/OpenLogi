@@ -15,19 +15,51 @@ build instructions, see the [README](../README.md).
 
 ## Building from source
 
-CLI:
+Nix/devenv is optional. A normal Rust toolchain is enough.
+
+### Without Nix
 
 ```sh
+# rustup installs the stable toolchain pinned in rust-toolchain.toml
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+# macOS: full Xcode 16+ with the Metal Toolchain (not only Command Line Tools)
+# Linux: see system libraries under Toolchain above
+# optional helpers: brew install cmake create-dmg sccache
 git clone https://github.com/AprilNEA/OpenLogi
 cd OpenLogi
 cargo run -p openlogi --release -- list
-```
-
-Desktop app:
-
-```sh
 cargo run -p openlogi-gui --release
 ```
+
+If you use [direnv](https://direnv.net) without devenv installed, `.envrc`
+prints a notice and leaves your shell alone. Install rustup/cargo yourself
+and keep working.
+
+### With devenv (optional)
+
+`devenv.nix` provisions sccache, the stable Rust toolchain, packaging helpers,
+and the macOS env overrides GPUI needs (`DEVELOPER_DIR` / `SDKROOT`). Tasks:
+
+```sh
+devenv tasks run openlogi:gui      # run the desktop app
+devenv tasks run openlogi:check    # fmt + clippy + tests (run before committing)
+devenv tasks run openlogi:dmg      # build the macOS DMG
+devenv tasks run openlogi:i18n-upload    # upload English source strings to Crowdin
+devenv tasks run openlogi:i18n-download  # download translations and run i18n tests
+```
+
+After a `devenv.nix` change, reload direnv so the new env takes effect:
+
+```sh
+direnv reload    # or: exit your shell and `cd` back in
+```
+
+Without that, GPUI's `gpui_macos` build script can't find Apple's `metal`
+shader compiler, and link errors about missing `_write` / `_sysconf` /
+`_waitpid` symbols show up because the Nix `apple-sdk-14.4` stub doesn't
+expose `libSystem` the way Apple's real linker wants.
+
+### Dev app bundle (macOS)
 
 On macOS the desktop binary is launched from inside a throwaway
 `target/dev/OpenLogi.app` — a Cargo `runner` wired in `.cargo/config.toml`
@@ -45,33 +77,6 @@ To install the CLI binary on `PATH`:
 ```sh
 cargo install --path .
 ```
-
-## Using devenv (macOS)
-
-The repo's `devenv.nix` provisions a Nix-based dev shell with sccache, the
-stable Rust toolchain, and the env overrides GPUI needs. It exposes tasks that
-mirror CI and packaging:
-
-```sh
-devenv tasks run openlogi:gui      # run the desktop app
-devenv tasks run openlogi:check    # fmt + clippy + tests (run before committing)
-devenv tasks run openlogi:dmg      # build the macOS DMG
-devenv tasks run openlogi:i18n-upload    # upload English source strings to Crowdin
-devenv tasks run openlogi:i18n-download  # download translations and run i18n tests
-```
-
-The first time you `cd` into the repo after pulling a change to `devenv.nix`,
-**reload direnv** so the new env vars (`DEVELOPER_DIR`, `SDKROOT`, the PATH
-filter that strips Nix's `xcbuild` xcrun stub) take effect:
-
-```sh
-direnv reload    # or: exit your shell and `cd` back in
-```
-
-Without that, GPUI's `gpui_macos` build script can't find Apple's `metal`
-shader compiler, and link errors about missing `_write` / `_sysconf` /
-`_waitpid` symbols show up because the Nix `apple-sdk-14.4` stub doesn't
-expose `libSystem` the way Apple's real linker wants.
 
 ## Project layout
 
@@ -182,3 +187,32 @@ cargo run -p xtask -- release latest-json \
   --base-url https://updates.openlogi.org \
   --output dist/latest.json
 ```
+
+## Crowdin translation sync
+
+`.github/workflows/crowdin.yml` uploads `crates/openlogi-gui/locales/en.yml` to
+[Crowdin](https://crowdin.com/project/openlogi) and opens a `crowdin/i18n` PR
+with fresh translations — nightly, and on master pushes touching the source
+strings. `crowdin.yml` limits exports to the locales shipped by the app and
+maps Crowdin language identifiers to their repository filenames.
+
+Like the release workflow, the job reads its credentials from one 1Password
+item referenced by the GitHub secret `OP_CROWDIN_SECRET_ITEM`. The item must
+contain:
+
+- `CROWDIN_PROJECT_ID` — the numeric Crowdin project id.
+- `CROWDIN_PERSONAL_TOKEN` — a Crowdin API token with access to the project.
+
+Grant the token only these scopes and restrict its granular access to the
+OpenLogi project:
+
+- Projects (List, Get, Create, Edit) — Read.
+- Translation Status — Read Only.
+- Source files & strings — Read and Write.
+- Translations — Read and Write.
+
+Missing or invalid credentials fail the workflow. Translation PRs run the
+normal CI checks, including the locale key-parity test. The workflow uses the
+existing `OP_GITHUB_APP_ITEM` to mint a short-lived token for pushing its
+translation branch and opening the PR; the default `GITHUB_TOKEN` remains
+read-only.
