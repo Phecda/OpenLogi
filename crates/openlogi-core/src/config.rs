@@ -8,6 +8,7 @@
 
 use std::{
     collections::BTreeMap,
+    ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
 };
@@ -130,6 +131,35 @@ pub enum ConfigError {
     },
 }
 
+/// Failure while preserving an unreadable configuration and replacing it
+/// with a fresh default document at the user's explicit request.
+#[derive(Debug, Error)]
+pub enum ConfigRecoveryError {
+    /// The platform config directory could not be resolved.
+    #[error("could not resolve config path")]
+    Path(#[from] PathsError),
+    /// The existing file could not be copied to the reported backup path.
+    #[error("could not back up config from {source_path} to {backup_path}")]
+    Backup {
+        /// Existing configuration being preserved.
+        source_path: PathBuf,
+        /// Non-overwriting backup destination selected for this recovery.
+        backup_path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: io::Error,
+    },
+    /// The backup succeeded, but writing the default configuration failed.
+    #[error("config was backed up at {backup_path}, but defaults could not be written")]
+    WriteDefaults {
+        /// Backup containing the exact original configuration.
+        backup_path: PathBuf,
+        /// Failure from the normal atomic config writer.
+        #[source]
+        source: Box<ConfigError>,
+    },
+}
+
 #[allow(
     clippy::result_large_err,
     reason = "Config I/O keeps rich parse/write context and is not a hot path"
@@ -196,6 +226,28 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })
+    }
+
+    /// Preserve the current user config in a non-overwriting sibling backup,
+    /// then atomically replace it with [`Config::default`].
+    ///
+    /// This is intentionally separate from loading: callers must first show
+    /// the load error and obtain explicit user consent. If the backup fails,
+    /// the original file is not modified. Returns the path of the backup.
+    pub fn backup_and_reset() -> Result<PathBuf, ConfigRecoveryError> {
+        Self::backup_and_reset_path(&paths::config_path()?)
+    }
+
+    /// Path-selectable form of [`Self::backup_and_reset`] for tests.
+    fn backup_and_reset_path(path: &Path) -> Result<PathBuf, ConfigRecoveryError> {
+        let backup_path = backup_config(path)?;
+        Self::default().save_to_path(path).map_err(|source| {
+            ConfigRecoveryError::WriteDefaults {
+                backup_path: backup_path.clone(),
+                source: Box::new(source),
+            }
+        })?;
+        Ok(backup_path)
     }
 
     /// Returns the bindings stored for `device_key`, or an empty map if the
@@ -585,6 +637,55 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.commit()
 }
 
+/// Copy `path` to the first free `config.toml.bak[.N]` sibling without ever
+/// overwriting an earlier recovery backup.
+fn backup_config(path: &Path) -> Result<PathBuf, ConfigRecoveryError> {
+    let file_name = path
+        .file_name()
+        .map_or_else(|| OsString::from("config.toml"), OsString::from);
+
+    for suffix in 0_u32.. {
+        let mut backup_name = file_name.clone();
+        backup_name.push(".bak");
+        if suffix > 0 {
+            backup_name.push(format!(".{suffix}"));
+        }
+        let backup_path = path.with_file_name(backup_name);
+        if let Err(source) = copy_file_exclusive(path, &backup_path) {
+            if source.kind() == io::ErrorKind::AlreadyExists {
+                continue;
+            }
+            return Err(ConfigRecoveryError::Backup {
+                source_path: path.to_path_buf(),
+                backup_path,
+                source,
+            });
+        }
+        return Ok(backup_path);
+    }
+    unreachable!("u32 backup suffix space cannot be exhausted in practice")
+}
+
+fn copy_file_exclusive(source_path: &Path, backup_path: &Path) -> io::Result<()> {
+    let mut source = fs::File::open(source_path)?;
+    let permissions = source.metadata()?.permissions();
+    let mut backup = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(backup_path)?;
+
+    let result = (|| {
+        io::copy(&mut source, &mut backup)?;
+        backup.set_permissions(permissions)?;
+        backup.sync_all()
+    })();
+    if result.is_err() {
+        drop(backup);
+        let _ = fs::remove_file(backup_path);
+    }
+    result
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, reason = "expect/unwrap are idiomatic in tests")]
 mod tests {
@@ -607,6 +708,54 @@ mod tests {
         let cfg = Config::load_from_path(&path).expect("load");
         assert_eq!(cfg.schema_version, SCHEMA_VERSION);
         assert!(cfg.devices.is_empty());
+    }
+
+    #[test]
+    fn recovery_preserves_invalid_config_before_writing_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let original = b"schema_version = this is not toml\n";
+        fs::write(&path, original).expect("write invalid config");
+
+        let backup = Config::backup_and_reset_path(&path).expect("recover config");
+
+        assert_eq!(backup, dir.path().join("config.toml.bak"));
+        assert_eq!(fs::read(backup).expect("read backup"), original);
+        let reset = Config::load_from_path(&path).expect("load reset config");
+        assert_eq!(reset.schema_version, SCHEMA_VERSION);
+        assert!(reset.devices.is_empty());
+    }
+
+    #[test]
+    fn recovery_never_overwrites_an_existing_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let first_backup = dir.path().join("config.toml.bak");
+        fs::write(&path, "broken current config").expect("write config");
+        fs::write(&first_backup, "older preserved config").expect("write existing backup");
+
+        let backup = Config::backup_and_reset_path(&path).expect("recover config");
+
+        assert_eq!(backup, dir.path().join("config.toml.bak.1"));
+        assert_eq!(
+            fs::read_to_string(first_backup).expect("read existing backup"),
+            "older preserved config"
+        );
+        assert_eq!(
+            fs::read_to_string(backup).expect("read new backup"),
+            "broken current config"
+        );
+    }
+
+    #[test]
+    fn recovery_does_not_create_defaults_when_backup_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("missing.toml");
+
+        let error = Config::backup_and_reset_path(&path).expect_err("backup must fail");
+
+        assert_matches!(error, ConfigRecoveryError::Backup { .. });
+        assert!(!path.exists());
     }
 
     #[test]
