@@ -83,17 +83,11 @@ access devices directly.
 
 ## Build, run, verify
 
-Nix/devenv is optional — rustup + `rust-toolchain.toml` is enough. If devenv is
-installed, direnv loads it; otherwise `.envrc` prints a notice and leaves PATH
-alone so system `cargo` works. With devenv active, cargo may only be on PATH
-inside the shell — run from the repo root (or `direnv exec . …`), including
-git (the hooks need cargo):
+Use the locally installed Rust toolchain and command-line tools directly. **Do not invoke commands through Nix, devenv, direnv, or similar environment wrappers.** Run `cargo`, `rustc`, `git`, and other tools directly from the repo root. If a required tool or target is missing from `PATH`, stop and report the missing prerequisite instead of activating or installing a Nix environment.
 
 ```sh
 cargo check -p openlogi-core
-# when cargo is only inside devenv:
-direnv exec . cargo check -p openlogi-core
-direnv exec . git commit …
+git commit …
 ```
 
 ### Verification while iterating (fast path)
@@ -132,8 +126,7 @@ A skipped job is **not** a pass. These procedures do not authorize a push.
 
 - Dev-run with `cargo run -p openlogi-desktop` — a cargo runner wraps the build into
   `target/dev/OpenLogi.app` with the same identity, helper and plist tables packaging
-  uses. The macOS GUI build needs full Xcode for GPUI's Metal shaders; devenv sets the
-  env when present (`direnv reload` if the shader compile fails there).
+  uses. The macOS GUI build needs full Xcode for GPUI's Metal shaders.
 - `cargo build` does NOT refresh that bundle, and a second instance exits on the
   singleton lock: quit the old instance and re-`run` before judging a UI change
   "not applied".
@@ -152,8 +145,8 @@ A skipped job is **not** a pass. These procedures do not authorize a push.
 
 Edition 2024, MSRV = current stable (1.98), one shared workspace lint table. The
 floor tracks stable instead of trailing it — raise it the day a release ships
-something worth using, and run `devenv update rust-overlay` with it so the local
-toolchain stops being older than CI's. The full standards — the
+something worth using, and keep the local toolchain in step with it so it stops
+being older than CI's. The full standards — the
 lint table and what it changes day to day, typed-invariant style, house rules on
 refactoring, dependencies, and module layout — live in `.agents/rules/rust.md`,
 loaded for any Rust or `Cargo.toml` edit.
