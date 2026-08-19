@@ -267,6 +267,16 @@ creates — **never hand-create the tag**. Published GitHub releases are immutab
 never re-run a failed release job or re-dispatch on an existing tag.
 `release-plz.toml` is the versioning contract — don't trim it.
 
+## Personal macOS release build (my-release only)
+
+This is Zhipeng Su's private installation workflow and must stay on the `my-release` branch. Do not copy it to upstream branches, public release documentation, or CI.
+
+The intended signing identity is `Apple Development: szp12345141@sina.com (NANPA56NE4)`, personal Team ID `ZCZ85Z8LUT`. Do not pass this identity directly to the current `xtask macos package` command and install its output. On macOS 26.5.2, `codesign --verify` succeeds but launchd rejects the app with `RBSRequestErrorDomain Code=5` / `NSPOSIXErrorDomain Code=163` and removes the rejected bundle. A minimal comparison app proves that this personal identity has the same failure while the company Apple Development identity launches successfully.
+
+The personal identity requires Xcode-managed macOS development provisioning for the GUI and embedded Agent. The current packaging path neither embeds provisioning profiles nor signs with their required entitlements. Implement and validate that profile-backed path before documenting it as usable. Creating profiles may register bundle identifiers in the Apple developer account; do not invoke `xcodebuild -allowProvisioningUpdates` without explicit approval.
+
+Never replace `/Applications/OpenLogi.app` as the first launch test. Extract the candidate into a disposable directory, verify the outer app and embedded Agent report `TeamIdentifier=ZCZ85Z8LUT`, launch the disposable app, and confirm both `openlogi-gui` and `openlogi-agent` remain running without the bundle being removed. Only then install it. The first working switch from official Team ID `8U3ZJ258K9` will require granting macOS permissions again. Later personal builds should retain those permissions only while the Team ID, bundle identifiers, profiles, and signing requirements remain stable. Never use ad-hoc signing for the installed copy.
+
 ## Verification
 
 Define the concrete check that proves a change works before writing it — a failing test
