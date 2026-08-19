@@ -40,17 +40,11 @@ sits beneath both.
 
 ## Build, run, verify
 
-Nix/devenv is optional — rustup + `rust-toolchain.toml` is enough. If devenv is
-installed, direnv loads it; otherwise `.envrc` prints a notice and leaves PATH
-alone so system `cargo` works. With devenv active, cargo may only be on PATH
-inside the shell — run from the repo root (or `direnv exec . …`), including
-git (the hooks need cargo):
+Use the locally installed Rust toolchain and command-line tools directly. **Do not invoke commands through Nix, devenv, direnv, or similar environment wrappers.** Run `cargo`, `rustc`, `git`, and other tools directly from the repo root. If a required tool or target is missing from `PATH`, stop and report the missing prerequisite instead of activating or installing a Nix environment.
 
 ```sh
 cargo clippy --workspace --all-targets -- -D warnings
-# when cargo is only inside devenv:
-direnv exec . cargo clippy --workspace --all-targets -- -D warnings
-direnv exec . git commit …
+git commit …
 ```
 
 ### Local gate (hard stop — do this before every push)
@@ -65,7 +59,6 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 RUSTDOCFLAGS="-D warnings" cargo doc -p openlogi-hid -p openlogi-hidpp \
   -p openlogi-hidpp-derive --no-deps --document-private-items
-# or: devenv tasks run openlogi:check
 ```
 
 Exit non-zero on any of those → fix, re-run the **whole** set, then push.
@@ -104,10 +97,16 @@ When the diff touches any of:
 - `crates/openlogi-hid/src/transport.rs` (has `#[cfg]` branches)
 - any `#[cfg(target_os = …)]` block
 
-you MUST either:
+you MUST:
 
-1. Cross-check with devenv when available:
-   `devenv tasks run openlogi:check-windows` (and any linux check the repo has), or
+1. Cross-check directly with the installed Windows GNU target:
+   ```sh
+   cargo clippy --target x86_64-pc-windows-gnu \
+     -p openlogi-core -p openlogi-hidpp -p openlogi-hid -p openlogi-hook \
+     -p openlogi-agent -p openlogi-agent-core \
+     --all-targets -- -D warnings
+   ```
+   If the target or another prerequisite is missing, stop and report it; do not install or activate another environment.
 2. Manually re-read every changed cfg-gated file against **current master** for:
    - name collisions with existing `pub use` / `pub const` items
    - type mismatches (`u16` vs `u32`, `Option` arity, new enum fields)
@@ -137,9 +136,7 @@ New GUI strings: insert the same key in the **same position** in every
 
 ### App / agent runtime notes
 
-- The macOS GUI build needs full Xcode for GPUI's Metal shaders. devenv sets
-  `DEVELOPER_DIR`/`SDKROOT` when present; without it, use system Xcode. If the
-  shader compile fails under devenv, `direnv reload` first.
+- The macOS GUI build needs full Xcode for GPUI's Metal shaders. If shader compilation fails, verify the local Xcode installation and selected developer directory; do not switch to Nix or direnv as a workaround.
 - Dev-run the app with `cargo run -p openlogi-gui` — a cargo runner wraps it
   into `target/dev/OpenLogi.app`. `cargo build` does NOT refresh that bundle,
   and a second instance exits on the singleton lock: quit the old instance and
