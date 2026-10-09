@@ -4,7 +4,7 @@ use super::*;
 use crate::watchers::retry::wait_for_deadline;
 use openlogi_core::binding::{Action, Binding, ButtonId, GestureDirection};
 use openlogi_core::config::{ThumbwheelSensitivity, VerticalScrollSensitivity};
-use openlogi_hid::{CaptureChannelSlot, DeviceRoute};
+use openlogi_hid::{CaptureChannelSlot, CaptureSessionStop, DeviceRoute};
 
 fn route() -> DeviceRoute {
     DeviceRoute::Direct {
@@ -22,11 +22,15 @@ fn session_id(epoch: u64) -> HidppSessionId {
 }
 
 fn plan() -> DeviceCapturePlan {
+    plan_with_route(route())
+}
+
+fn plan_with_route(route: DeviceRoute) -> DeviceCapturePlan {
     crate::capture_plan::plan_for_device(
         &openlogi_core::config::Config::default(),
         physical_key(),
         "mouse-a",
-        route(),
+        route,
         None,
         0,
         true,
@@ -46,6 +50,112 @@ fn draining_session_with_epoch(epoch: u64) -> RunningSession {
     let mut session = live_session_with_epoch(epoch);
     assert_eq!(session.reconcile(None), ReconcileAction::Retiring);
     session
+}
+
+#[test]
+fn capture_plan_selection_switches_transport_after_retirement() {
+    let receiver = DeviceRoute::Unifying {
+        receiver_uid: "receiver-a".to_owned(),
+        slot: 1,
+    };
+    let direct = route();
+    let plans = vec![
+        plan_with_route(receiver.clone()),
+        plan_with_route(direct.clone()),
+    ];
+
+    assert_eq!(
+        select_plan(
+            &physical_key(),
+            RoutePreference::ReplacementOf(&receiver),
+            &plans,
+        )
+        .map(|plan| &plan.target.route),
+        Some(&direct),
+        "Unifying retirement must re-arm on Bluetooth when both routes remain published"
+    );
+    assert_eq!(
+        select_plan(
+            &physical_key(),
+            RoutePreference::ReplacementOf(&direct),
+            &plans,
+        )
+        .map(|plan| &plan.target.route),
+        Some(&receiver),
+        "Bluetooth retirement must re-arm on Unifying even when the old direct route stays published"
+    );
+}
+
+#[test]
+fn capture_plan_selection_keeps_a_running_route() {
+    let receiver = DeviceRoute::Unifying {
+        receiver_uid: "receiver-a".to_owned(),
+        slot: 1,
+    };
+    let direct = route();
+    let plans = vec![
+        plan_with_route(receiver.clone()),
+        plan_with_route(direct.clone()),
+    ];
+
+    for expected in [&receiver, &direct] {
+        assert_eq!(
+            select_plan(&physical_key(), RoutePreference::Exact(expected), &plans,)
+                .map(|plan| &plan.target.route),
+            Some(expected),
+            "a running session must not move while its route is still published"
+        );
+    }
+}
+
+#[test]
+fn capture_plan_selection_uses_the_remaining_route_when_the_retired_one_disappears() {
+    let receiver = DeviceRoute::Unifying {
+        receiver_uid: "receiver-a".to_owned(),
+        slot: 1,
+    };
+    let direct = route();
+    let plans = vec![plan_with_route(direct.clone())];
+
+    assert_eq!(
+        select_plan(
+            &physical_key(),
+            RoutePreference::ReplacementOf(&receiver),
+            &plans,
+        )
+        .map(|plan| &plan.target.route),
+        Some(&direct),
+        "a restore or successor must not be pinned to an unpublished retired route"
+    );
+}
+
+#[test]
+fn receiver_route_change_requests_a_firmware_handoff() {
+    let old_plan = plan();
+    let mut new_plan = old_plan.clone();
+    let successor_route = DeviceRoute::Unifying {
+        receiver_uid: "receiver-b".to_owned(),
+        slot: 2,
+    };
+    new_plan.target.route.clone_from(&successor_route);
+    let (stop, mut stopped) = oneshot::channel();
+    let mut session =
+        CaptureSession::active(session_id(7), old_plan.target, old_plan.dispatch, stop);
+
+    assert_eq!(
+        session.reconcile_with(
+            Some((&new_plan.target, &new_plan.dispatch)),
+            stop_for_target_change,
+        ),
+        ReconcileAction::Retiring
+    );
+    assert_eq!(
+        stopped
+            .try_recv()
+            .expect("route change should stop the active session"),
+        CaptureSessionStop::Handoff(successor_route),
+        "teardown must restore through the route the mouse moved to"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -221,6 +331,7 @@ async fn input_accepted_during_restoration_precedes_session_done() {
         SessionDone {
             physical_key: key.clone(),
             session: id.clone(),
+            route: route(),
             pending_restore: None,
         },
     ));

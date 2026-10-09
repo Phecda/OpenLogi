@@ -41,7 +41,7 @@ use arm::{ArmedControls, ArmedThumbwheel, arm_controls};
 
 pub use super::capture_restore::{
     CaptureChannelSlot, CaptureError, CaptureSessionFailure, CaptureSessionOutcome,
-    PendingCaptureRestore,
+    CaptureSessionStop, PendingCaptureRestore,
 };
 use crate::reprog_controls::{self, ReprogControlsV4};
 use crate::thumbwheel::{self, WheelResolution};

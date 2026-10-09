@@ -7,6 +7,7 @@
 //! authoritative until its asynchronous teardown reports completion, and a
 //! running epoch is mutually exclusive with post-session recovery.
 
+use openlogi_hid::CaptureSessionStop;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
@@ -36,7 +37,7 @@ pub(super) enum CompletionAction {
 }
 
 enum SessionPhase {
-    Active(oneshot::Sender<()>),
+    Active(oneshot::Sender<CaptureSessionStop>),
     Draining,
 }
 
@@ -164,7 +165,7 @@ impl<Target, Dispatch> CaptureSession<Target, Dispatch> {
         id: HidppSessionId,
         target: Target,
         dispatch: Dispatch,
-        stop: oneshot::Sender<()>,
+        stop: oneshot::Sender<CaptureSessionStop>,
     ) -> Self {
         Self {
             id,
@@ -180,7 +181,6 @@ impl<Target, Dispatch> CaptureSession<Target, Dispatch> {
     }
 
     /// Hardware capture identity that decides whether rearming is required.
-    #[cfg(test)]
     pub(super) fn target(&self) -> &Target {
         &self.target
     }
@@ -224,7 +224,11 @@ impl<Target: PartialEq, Dispatch: Clone + PartialEq> CaptureSession<Target, Disp
     /// Reconcile against the latest wanted target and dispatch state. A target
     /// change begins teardown exactly once; dispatch-only changes hot-refresh
     /// the plan while preserving the hardware epoch.
-    pub(super) fn reconcile(&mut self, wanted: Option<(&Target, &Dispatch)>) -> ReconcileAction {
+    pub(super) fn reconcile_with(
+        &mut self,
+        wanted: Option<(&Target, &Dispatch)>,
+        stop_for_change: impl FnOnce(&Target, Option<&Target>) -> CaptureSessionStop,
+    ) -> ReconcileAction {
         if !self.is_active() {
             return ReconcileAction::None;
         }
@@ -237,12 +241,18 @@ impl<Target: PartialEq, Dispatch: Clone + PartialEq> CaptureSession<Target, Disp
             self.dispatch.clone_from(dispatch);
             return ReconcileAction::DispatchChanged;
         }
+        let stop_command = stop_for_change(&self.target, wanted.map(|(target, _)| target));
         let SessionPhase::Active(stop) = std::mem::replace(&mut self.phase, SessionPhase::Draining)
         else {
             return ReconcileAction::None;
         };
-        let _ = stop.send(());
+        let _ = stop.send(stop_command);
         ReconcileAction::Retiring
+    }
+
+    /// Reconcile a session that has no route-specific teardown command.
+    pub(super) fn reconcile(&mut self, wanted: Option<(&Target, &Dispatch)>) -> ReconcileAction {
+        self.reconcile_with(wanted, |_, _| CaptureSessionStop::Shutdown)
     }
 }
 

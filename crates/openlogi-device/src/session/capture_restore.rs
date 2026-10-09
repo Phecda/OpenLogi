@@ -14,7 +14,7 @@ use super::restore::{PendingRestore, RestoreOutcome, RestorePlan, SessionFailure
 use crate::backend::BackendError;
 use crate::reprog_controls::{self, ReprogControlsV4};
 use crate::thumbwheel::Thumbwheel;
-use crate::{ChannelRegistry, IoSuspended, SharedChannel};
+use crate::{ChannelRegistry, DeviceRoute, IoSuspended, SharedChannel};
 
 /// Shared slot holding the active capture session's open channel, so bounded
 /// hardware writes can reuse it instead of opening a second connection.
@@ -72,12 +72,24 @@ impl ReprogRestore {
     }
 }
 
-#[derive(Clone, Copy)]
+/// Why a capture manager is asking an active session to stop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureSessionStop {
+    /// Capture is no longer wanted, or its controls changed on the same route.
+    Shutdown,
+    /// The same physical device moved to another route. Its firmware state
+    /// must be restored through that route before the successor arms.
+    Handoff(DeviceRoute),
+}
+
+#[derive(Clone)]
 pub(crate) enum CaptureStop {
     /// The owner deliberately requested teardown.
     Shutdown,
     /// Inventory removed or replaced the channel that armed capture.
     ChannelChanged,
+    /// The manager identified the route the same physical device moved to.
+    Handoff(DeviceRoute),
 }
 
 /// What a capture session writes to hand its controls back: every diverted
@@ -168,6 +180,7 @@ pub(crate) async fn restore_after_stop(
     match stop {
         CaptureStop::Shutdown => pending.allow_current_channel().retry(registry).await,
         CaptureStop::ChannelChanged => pending.retry(registry).await,
+        CaptureStop::Handoff(route) => pending.retry_via(route, registry).await,
     }
 }
 

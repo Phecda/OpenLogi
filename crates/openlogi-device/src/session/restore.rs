@@ -80,6 +80,12 @@ impl<P> PendingRestore<P> {
         self.retired_policy = RetiredChannelPolicy::CurrentAllowed;
         self
     }
+
+    /// The transport on which the session that owes this restore ran.
+    #[must_use]
+    pub fn route(&self) -> &DeviceRoute {
+        &self.route
+    }
 }
 
 impl<P: RestorePlan> PendingRestore<P> {
@@ -90,6 +96,30 @@ impl<P: RestorePlan> PendingRestore<P> {
     /// token as pending, with every control still owed, so the new winner is
     /// restored on the next attempt.
     pub async fn retry(self, registry: &ChannelRegistry) -> RestoreOutcome<P> {
+        self.retry_current_route(registry).await
+    }
+
+    /// Retry through a newly elected route to the same physical device.
+    ///
+    /// The caller owns physical identity and must only supply a route resolved
+    /// for the device whose firmware this token owns. The route becomes the
+    /// fallback for later retries, so repeated host switches can keep moving
+    /// restoration toward the device's latest live transport.
+    pub async fn retry_via(
+        mut self,
+        route: DeviceRoute,
+        registry: &ChannelRegistry,
+    ) -> RestoreOutcome<P> {
+        self.route = route;
+        // Physical identity elected this route. If a rapid switch returns to
+        // the still-current channel that originally armed capture, restoring
+        // there is now safe; ordinary channel-replacement retries retain the
+        // stricter replacement-only policy.
+        self.retired_policy = RetiredChannelPolicy::CurrentAllowed;
+        self.retry_current_route(registry).await
+    }
+
+    async fn retry_current_route(self, registry: &ChannelRegistry) -> RestoreOutcome<P> {
         let Some(current) = registry.lookup(&self.route) else {
             return RestoreOutcome::RestorePending(self);
         };
