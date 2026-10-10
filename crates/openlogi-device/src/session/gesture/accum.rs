@@ -66,14 +66,39 @@ pub(super) struct CaptureAccum {
     buttons_down: Vec<u16>,
 }
 
-#[cfg(test)]
 impl CaptureAccum {
+    /// Forget gesture ownership when the active raw-XY sources change. A
+    /// report after a spec reload must never be attributed to a source that is
+    /// no longer diverted.
+    pub(super) fn reset_gesture_state(&mut self) {
+        self.hold = HoldState::Idle;
+        self.gestures_down.clear();
+    }
+
+    /// Drop physical button edges for controls that are no longer captured.
+    pub(super) fn retain_buttons(&mut self, active: &[u16]) {
+        self.buttons_down.retain(|cid| active.contains(cid));
+    }
+
+    pub(super) fn reset_dpi_state(&mut self) {
+        self.dpi_down = false;
+    }
+
     /// Test-only seam mirroring [`SwipeAccumulator::backdate_hold_for_test`]
     /// for the current hold. A no-op while idle.
+    #[cfg(test)]
     pub(super) fn backdate_hold_for_test(&mut self) {
         if let HoldState::Holding { swipe, .. } = &mut self.hold {
             swipe.backdate_hold_for_test();
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn input_state_is_clear_for_test(&self) -> bool {
+        matches!(self.hold, HoldState::Idle)
+            && self.gestures_down.is_empty()
+            && !self.dpi_down
+            && self.buttons_down.is_empty()
     }
 }
 

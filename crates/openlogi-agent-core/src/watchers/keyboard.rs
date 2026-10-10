@@ -592,6 +592,7 @@ fn spawn_session(
             CaptureHost {
                 sink,
                 shutdown: stop_rx,
+                spec_updates: None,
                 channel_slot: slot,
                 registry: &session_registry,
                 device_io,

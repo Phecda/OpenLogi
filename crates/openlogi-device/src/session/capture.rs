@@ -22,7 +22,7 @@ use hidpp::{
     },
     protocol::v20,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
@@ -40,6 +40,9 @@ use crate::{ChannelRegistry, DeviceIoGate, DeviceRoute, SharedChannel};
 /// The reconnect broadcast arrives the instant the link is back, occasionally
 /// before the device accepts feature writes again.
 const REARM_SETTLE_DELAY: Duration = Duration::from_millis(200);
+/// Retry a capture-spec reload on the live channel after a transient HID++
+/// write failure.
+const SPEC_UPDATE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// What the process running a capture session hands it: where inputs go, when
 /// to stop, and the handles that tie the session to the rest of the device
@@ -50,6 +53,9 @@ pub struct CaptureHost<'a> {
     /// Resolves, or is dropped, when the session should restore its controls
     /// and return.
     pub shutdown: oneshot::Receiver<CaptureSessionStop>,
+    /// Latest mutable gesture-capture specification. Keyboard sessions leave
+    /// this unset because their target still changes through normal teardown.
+    pub spec_updates: Option<watch::Receiver<super::gesture::CaptureSpec>>,
     /// Where the session publishes its open channel so bounded hardware
     /// writes reuse it instead of opening a second connection.
     pub channel_slot: CaptureChannelSlot,
@@ -131,6 +137,16 @@ pub(super) trait ArmedCapture {
     /// logged, not propagated: the next reconnection broadcast retries.
     async fn rearm(&self);
 
+    /// Apply a mutable capture specification without replacing the channel or
+    /// listener. Capture types without a hot-reloadable spec leave this as a
+    /// no-op.
+    async fn reconfigure(
+        &mut self,
+        _spec: &super::gesture::CaptureSpec,
+    ) -> Result<(), CaptureError> {
+        Ok(())
+    }
+
     /// Convert all armed firmware state into the one capability that can
     /// release it. Consuming `self` prevents a session and a restore retry
     /// from both claiming ownership at once.
@@ -145,12 +161,13 @@ pub(super) trait ArmedCapture {
 /// for the caller to retry on the current inventory channel.
 pub(super) async fn run_capture<A: ArmedCapture>(
     shared: SharedChannel,
-    armed: A,
+    mut armed: A,
     host: CaptureHost<'_>,
 ) -> CaptureSessionOutcome {
     let CaptureHost {
         sink,
         shutdown,
+        spec_updates,
         channel_slot,
         registry,
         device_io,
@@ -200,7 +217,7 @@ pub(super) async fn run_capture<A: ArmedCapture>(
     armed.log_active(device_index, wireless.is_some());
     let stop = monitor(
         CaptureMonitor {
-            armed: &armed,
+            armed: &mut armed,
             root: &root,
             device_index,
             registry,
@@ -209,6 +226,7 @@ pub(super) async fn run_capture<A: ArmedCapture>(
         },
         wireless,
         shutdown,
+        spec_updates,
         device_io,
     )
     .await;
@@ -236,7 +254,7 @@ pub(super) async fn run_capture<A: ArmedCapture>(
 
 /// Borrowed state used while monitoring one armed capture session.
 struct CaptureMonitor<'a, A> {
-    armed: &'a A,
+    armed: &'a mut A,
     root: &'a RootFeature,
     device_index: u8,
     registry: &'a ChannelRegistry,
@@ -292,15 +310,24 @@ async fn idle_deadline(watchdog: Option<&Watchdog<'_>>) {
 /// Keep a capture session alive and reapply its volatile diversions whenever
 /// the device announces a reconnect. Returns only the typed reason capture
 /// stopped; restoration performs a fresh registry lookup after monitoring.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the capture monitor keeps all lifecycle wakeups in one biased select"
+)]
 async fn monitor<A: ArmedCapture>(
     context: CaptureMonitor<'_, A>,
     wireless: Option<WirelessDeviceStatusFeature>,
     shutdown: oneshot::Receiver<CaptureSessionStop>,
+    mut spec_updates: Option<watch::Receiver<super::gesture::CaptureSpec>>,
     mut device_io: DeviceIoGate,
 ) -> CaptureStop {
     let mut wake_events = wireless.as_ref().map(EmittingFeature::listen);
     let mut shutdown = std::pin::pin!(shutdown);
     let mut watchdog = context.activity.map(Watchdog::new);
+    let mut pending_spec = None;
+    let mut retry_pending = false;
+    let retry = tokio::time::sleep(SPEC_UPDATE_RETRY_INTERVAL);
+    tokio::pin!(retry);
     loop {
         if !device_io.allows_io() {
             if !device_io.wait_until_allowed().await {
@@ -344,6 +371,46 @@ async fn monitor<A: ArmedCapture>(
                     Ok(CaptureSessionStop::Shutdown) | Err(_) => {
                         stop_for_current_publication(context.registry, context.shared)
                     }
+                }
+            }
+            changed = async {
+                match spec_updates.as_mut() {
+                    Some(updates) => updates.changed().await.ok(),
+                    None => std::future::pending().await,
+                }
+            } => {
+                let Some(updates) = spec_updates.as_mut() else {
+                    continue;
+                };
+                if changed.is_none() {
+                    spec_updates = None;
+                    continue;
+                }
+                pending_spec = Some(updates.borrow_and_update().clone());
+                if let Some(spec) = pending_spec.as_ref()
+                    && context.armed.reconfigure(spec).await.is_ok()
+                {
+                    pending_spec = None;
+                    retry_pending = false;
+                } else {
+                    retry_pending = true;
+                    retry
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + SPEC_UPDATE_RETRY_INTERVAL);
+                }
+            }
+            () = &mut retry, if retry_pending => {
+                let Some(spec) = pending_spec.clone() else {
+                    retry_pending = false;
+                    continue;
+                };
+                if context.armed.reconfigure(&spec).await.is_ok() {
+                    pending_spec = None;
+                    retry_pending = false;
+                } else {
+                    retry
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + SPEC_UPDATE_RETRY_INTERVAL);
                 }
             }
             event = async {

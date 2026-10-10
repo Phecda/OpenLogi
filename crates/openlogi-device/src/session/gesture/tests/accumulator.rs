@@ -32,6 +32,27 @@ fn release() -> RawControlEvent {
     RawControlEvent::DivertedButtons([0, 0, 0, 0])
 }
 
+#[test]
+fn removing_sources_and_buttons_clears_live_input_state() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut acc = CaptureAccum::default();
+    let button_cid = 0x0052;
+
+    acc.on_event(
+        RawControlEvent::DivertedButtons([reprog_controls::GESTURE_BUTTON_CID, button_cid, 0, 0]),
+        GESTURE,
+        &[0x00c4],
+        &[],
+        &[(button_cid, ButtonId::MiddleClick)],
+        &tx,
+    );
+    acc.reset_gesture_state();
+    acc.reset_dpi_state();
+    acc.retain_buttons(&[]);
+
+    assert!(acc.input_state_is_clear_for_test());
+}
+
 /// Read the next completed gesture while leaving lifecycle assertions to the
 /// dedicated edge tests below.
 fn next_gesture(

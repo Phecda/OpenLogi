@@ -24,8 +24,9 @@ use tokio::sync::watch;
 
 /// Hardware identity of one HID++ capture session.
 ///
-/// Equality is the rearm contract: changing any field requires restoring the
-/// old firmware diversion before a replacement session may start.
+/// Capture controls live in [`DeviceCapturePlan::spec`] so a changed
+/// specification can be applied to the existing session without replacing its
+/// channel or listener. Changing this value still requires a full re-arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureTarget {
     /// Physical identity used to serialize firmware ownership even when the
@@ -33,8 +34,6 @@ pub struct CaptureTarget {
     pub physical_key: PhysicalDeviceKey,
     /// HID++ route the session opens.
     pub route: DeviceRoute,
-    /// Exact controls and reporting modes the session owns in firmware.
-    pub spec: CaptureSpec,
     /// Orchestrator generation bumped after reconnect or system wake, forcing
     /// a rearm even when route and diversion still compare equal.
     pub rearm_generation: u64,
@@ -75,6 +74,8 @@ pub struct DispatchPlan {
 pub struct DeviceCapturePlan {
     /// Hardware state whose changes require a capture-session restart.
     pub target: CaptureTarget,
+    /// Exact controls and reporting modes the live session should own.
+    pub spec: CaptureSpec,
     /// Hot-replaceable action resolution for input from that target.
     pub dispatch: DispatchPlan,
 }
@@ -85,7 +86,7 @@ impl DeviceCapturePlan {
     /// keeps resolving them so a press the other session forwards still finds
     /// its action.
     pub(crate) fn release_controls(&mut self, owned: &BTreeMap<u16, ButtonId>) {
-        let spec = &mut self.target.spec;
+        let spec = &mut self.spec;
         let before = spec.divert_buttons.len()
             + spec.divert_gesture_buttons.len()
             + spec.divert_gesture_sources.len();
@@ -219,18 +220,18 @@ pub fn plan_for_device(
         target: CaptureTarget {
             physical_key,
             route,
-            spec: CaptureSpec {
-                capture_thumbwheel: thumbwheel_sensitivity != ThumbwheelSensitivity::DEFAULT
-                    || thumbwheel_bindings_nondefault,
-                divert_gesture_sources: GESTURE_SOURCE_BUTTONS
-                    .into_iter()
-                    .filter(|(_, button)| gesture_bindings.contains_key(button))
-                    .map(|(cid, _)| cid)
-                    .collect(),
-                divert_gesture_buttons,
-                divert_buttons,
-            },
             rearm_generation,
+        },
+        spec: CaptureSpec {
+            capture_thumbwheel: thumbwheel_sensitivity != ThumbwheelSensitivity::DEFAULT
+                || thumbwheel_bindings_nondefault,
+            divert_gesture_sources: GESTURE_SOURCE_BUTTONS
+                .into_iter()
+                .filter(|(_, button)| gesture_bindings.contains_key(button))
+                .map(|(cid, _)| cid)
+                .collect(),
+            divert_gesture_buttons,
+            divert_buttons,
         },
         dispatch: DispatchPlan {
             config_key: config_key.to_owned(),
@@ -282,8 +283,7 @@ mod tests {
     /// which CIDs those are is the device layer's table, not this crate's
     /// concern.
     fn diverts(plan: &DeviceCapturePlan, button: ButtonId) -> bool {
-        plan.target
-            .spec
+        plan.spec
             .divert_buttons
             .iter()
             .any(|&(_, diverted)| diverted == button)
@@ -312,7 +312,6 @@ mod tests {
         );
         assert!(
             !plan
-                .target
                 .spec
                 .divert_buttons
                 .iter()
@@ -336,16 +335,14 @@ mod tests {
 
         let plan = plan_for_device(&cfg, "2b01a", route(), None, 0, true);
         assert!(
-            plan.target
-                .spec
+            plan.spec
                 .divert_buttons
                 .contains(&(0x005b, ButtonId::WheelTiltLeft)),
             "a bound tilt must be diverted, or the binding can never fire: {:?}",
-            plan.target.spec.divert_buttons
+            plan.spec.divert_buttons
         );
         assert!(
             !plan
-                .target
                 .spec
                 .divert_buttons
                 .iter()
@@ -368,8 +365,7 @@ mod tests {
 
         let plan = plan_for_device(&cfg, "2b01a", route(), None, 0, true);
         assert!(
-            plan.target
-                .spec
+            plan.spec
                 .divert_buttons
                 .iter()
                 .any(|&(_, button)| button == ButtonId::Back),
@@ -488,7 +484,6 @@ mod tests {
         );
         assert!(
             !plan
-                .target
                 .spec
                 .divert_buttons
                 .iter()
@@ -511,8 +506,7 @@ mod tests {
 
         let plan = plan_for_device(&cfg, "2b042", route(), None, 0, true);
         assert!(
-            plan.target
-                .spec
+            plan.spec
                 .divert_buttons
                 .contains(&(HAPTIC_PANEL_CID, ButtonId::HapticPanel)),
             "a single-bound panel must be plain-diverted, or the binding can never fire"
@@ -526,8 +520,7 @@ mod tests {
         let plan = plan_for_device(&Config::default(), "2b042", route(), None, 0, true);
 
         assert!(
-            plan.target
-                .spec
+            plan.spec
                 .divert_buttons
                 .contains(&(HAPTIC_PANEL_CID, ButtonId::HapticPanel)),
             "the panel's default Actions Ring binding must be HID++-diverted"
@@ -547,7 +540,6 @@ mod tests {
         let plan = plan_for_device(&cfg, "2b042", route(), None, 0, true);
         assert!(
             !plan
-                .target
                 .spec
                 .divert_buttons
                 .iter()
@@ -574,8 +566,7 @@ mod tests {
             "gestures are off — no raw-XY gesture divert"
         );
         assert!(
-            plan.target
-                .spec
+            plan.spec
                 .divert_buttons
                 .contains(&(GESTURE_BUTTON_CID, ButtonId::GestureButton)),
             "a single-bound gesture button must be plain-diverted, or the binding can never fire"
@@ -598,7 +589,6 @@ mod tests {
         );
         assert!(
             !plan
-                .target
                 .spec
                 .divert_buttons
                 .iter()
@@ -616,8 +606,7 @@ mod tests {
 
         let plan = plan_for_device(&cfg, "2b042", route(), None, 0, true);
         assert!(
-            plan.target
-                .spec
+            plan.spec
                 .divert_buttons
                 .contains(&(GESTURE_BUTTON_CID, ButtonId::GestureButton)),
             "a gestures-off Mission Control binding must reach the agent"
@@ -636,13 +625,27 @@ mod tests {
         let plan = plan_for_device(&cfg, "2b042", route(), None, 0, true);
         assert!(
             !plan
-                .target
                 .spec
                 .divert_buttons
                 .iter()
                 .any(|&(cid, _)| cid == GESTURE_BUTTON_CID),
             "an explicitly unbound gesture button must not be captured"
         );
+    }
+
+    #[test]
+    fn changing_capture_spec_does_not_change_hardware_target() {
+        let mut config = Config::default();
+        let native = plan_for_device(&config, "2b01a", route(), None, 0, true);
+        config.set_binding(
+            "2b01a",
+            ButtonId::ThumbwheelScrollUp,
+            Binding::Single(Action::Copy),
+        );
+        let diverted = plan_for_device(&config, "2b01a", route(), None, 0, true);
+
+        assert_eq!(native.target, diverted.target);
+        assert_ne!(native.spec, diverted.spec);
     }
 
     #[test]
@@ -668,12 +671,11 @@ mod tests {
                 .filter(|(_, button)| matches!(button, ButtonId::Back | ButtonId::Forward))
                 .collect();
             assert_eq!(
-                plan.target.spec.divert_gesture_buttons, expected,
+                plan.spec.divert_gesture_buttons, expected,
                 "every known Back/Forward CID must be requested as a HID++ raw-XY gesture source"
             );
             assert!(
                 !plan
-                    .target
                     .spec
                     .divert_buttons
                     .iter()
@@ -682,7 +684,6 @@ mod tests {
             );
             assert!(
                 !plan
-                    .target
                     .spec
                     .divert_gesture_buttons
                     .iter()
@@ -690,7 +691,7 @@ mod tests {
             );
         } else {
             assert!(plan.dispatch.side_gesture_bindings.is_empty());
-            assert!(plan.target.spec.divert_gesture_buttons.is_empty());
+            assert!(plan.spec.divert_gesture_buttons.is_empty());
         }
     }
 
@@ -706,7 +707,7 @@ mod tests {
                 .contains_key(&ButtonId::DpiToggle)
         );
         assert_eq!(
-            plan.target.spec.divert_gesture_buttons,
+            plan.spec.divert_gesture_buttons,
             DPI_MODE_SHIFT_CIDS
                 .into_iter()
                 .map(|cid| (cid, ButtonId::DpiToggle))
@@ -735,8 +736,7 @@ mod tests {
                     !overridden
                 );
                 assert_eq!(
-                    plan.target
-                        .spec
+                    plan.spec
                         .divert_gesture_buttons
                         .iter()
                         .any(|&(_, button)| button == ButtonId::DpiToggle),
@@ -760,7 +760,7 @@ mod tests {
                 .contains_key(&ButtonId::DpiToggle)
         );
         assert_eq!(
-            restored.target.spec.divert_gesture_buttons.len(),
+            restored.spec.divert_gesture_buttons.len(),
             DPI_MODE_SHIFT_CIDS.len()
         );
     }
@@ -773,10 +773,9 @@ mod tests {
 
         let plan = plan_for_device(&cfg, "2b042", route(), None, 0, true);
         assert!(plan.dispatch.side_gesture_bindings.is_empty());
-        assert!(plan.target.spec.divert_gesture_buttons.is_empty());
+        assert!(plan.spec.divert_gesture_buttons.is_empty());
         assert!(
             !plan
-                .target
                 .spec
                 .divert_buttons
                 .iter()
@@ -805,7 +804,6 @@ mod tests {
         let plan = plan_for_device(&cfg, "2b042", route(), None, 0, true);
         assert!(
             !plan
-                .target
                 .spec
                 .divert_buttons
                 .iter()
@@ -813,8 +811,7 @@ mod tests {
             "capture opt-out must leave all OS-hook buttons native"
         );
         assert!(
-            plan.target
-                .spec
+            plan.spec
                 .divert_buttons
                 .iter()
                 .any(|&(_, button)| button == ButtonId::GestureButton),
@@ -828,7 +825,7 @@ mod tests {
         cfg.set_gesture_mode("2b042", ButtonId::Forward, true);
 
         let plan = plan_for_device(&cfg, "2b042", route(), None, 0, false);
-        assert!(plan.target.spec.divert_gesture_buttons.is_empty());
+        assert!(plan.spec.divert_gesture_buttons.is_empty());
         if cfg!(any(target_os = "macos", target_os = "windows")) {
             assert!(
                 plan.dispatch

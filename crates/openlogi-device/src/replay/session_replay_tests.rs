@@ -177,6 +177,7 @@ impl ArmedReplay {
         let host = CaptureHost {
             sink,
             shutdown: shutdown_rx,
+            spec_updates: None,
             channel_slot: Arc::clone(&self.channel_slot),
             registry: &self.registry,
             device_io: self.io_gate.clone(),

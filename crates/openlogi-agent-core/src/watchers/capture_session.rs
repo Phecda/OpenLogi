@@ -7,8 +7,8 @@
 //! authoritative until its asynchronous teardown reports completion, and a
 //! running epoch is mutually exclusive with post-session recovery.
 
-use openlogi_hid::CaptureSessionStop;
-use tokio::sync::oneshot;
+use openlogi_hid::{CaptureSessionStop, session::gesture::CaptureSpec};
+use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
 
 use crate::runtime::HidppSessionId;
@@ -47,6 +47,8 @@ pub(super) struct CaptureSession<Target, Dispatch> {
     id: HidppSessionId,
     target: Target,
     dispatch: Dispatch,
+    capture_spec: Option<CaptureSpec>,
+    spec_updates: Option<watch::Sender<CaptureSpec>>,
     phase: SessionPhase,
 }
 
@@ -171,6 +173,28 @@ impl<Target, Dispatch> CaptureSession<Target, Dispatch> {
             id,
             target,
             dispatch,
+            capture_spec: None,
+            spec_updates: None,
+            phase: SessionPhase::Active(stop),
+        }
+    }
+
+    /// Begin tracking a gesture capture task whose controls can be changed
+    /// without replacing its channel and listener.
+    pub(super) fn active_with_spec_updates(
+        id: HidppSessionId,
+        target: Target,
+        dispatch: Dispatch,
+        capture_spec: CaptureSpec,
+        spec_updates: watch::Sender<CaptureSpec>,
+        stop: oneshot::Sender<CaptureSessionStop>,
+    ) -> Self {
+        Self {
+            id,
+            target,
+            dispatch,
+            capture_spec: Some(capture_spec),
+            spec_updates: Some(spec_updates),
             phase: SessionPhase::Active(stop),
         }
     }
@@ -190,6 +214,11 @@ impl<Target, Dispatch> CaptureSession<Target, Dispatch> {
         &self.dispatch
     }
 
+    #[cfg(test)]
+    pub(super) fn capture_spec(&self) -> Option<&CaptureSpec> {
+        self.capture_spec.as_ref()
+    }
+
     /// Whether this task has not yet been asked to drain.
     pub(super) fn is_active(&self) -> bool {
         matches!(&self.phase, SessionPhase::Active(_))
@@ -206,6 +235,26 @@ impl<Target, Dispatch> CaptureSession<Target, Dispatch> {
     /// remain attributable through [`Self::owns`]'s epoch comparison.
     pub(super) fn rekey(&mut self, device_key: &str) {
         self.id.rekey(device_key);
+    }
+
+    /// Publish a new in-place capture specification. A closed receiver means
+    /// the detached device task has already ended and the caller must retire
+    /// this tracking entry so it can be replaced.
+    pub(super) fn update_capture_spec(&mut self, spec: &CaptureSpec) -> bool {
+        let Some(current) = self.capture_spec.as_ref() else {
+            return false;
+        };
+        if current == spec {
+            return true;
+        }
+        let Some(updates) = self.spec_updates.as_ref() else {
+            return false;
+        };
+        if updates.send(spec.clone()).is_err() {
+            return false;
+        }
+        self.capture_spec = Some(spec.clone());
+        true
     }
 
     /// Classify a task-completion report against this tracked epoch.
@@ -275,6 +324,29 @@ mod tests {
         );
         assert!(session.is_active());
         assert_eq!(session.dispatch(), &"new");
+    }
+
+    #[tokio::test]
+    async fn spec_refresh_publishes_without_retiring_the_hardware_epoch() {
+        let (stop, _stop_rx) = oneshot::channel();
+        let (updates, mut receiver) = watch::channel(CaptureSpec::default());
+        let mut session = CaptureSession::active_with_spec_updates(
+            HidppSessionId::with_epoch("mouse-a", 7),
+            1u8,
+            "old",
+            CaptureSpec::default(),
+            updates,
+            stop,
+        );
+        let next = CaptureSpec {
+            capture_thumbwheel: true,
+            ..CaptureSpec::default()
+        };
+
+        assert!(session.update_capture_spec(&next));
+        assert!(session.is_active());
+        receiver.changed().await.expect("spec sender remains live");
+        assert_eq!(&*receiver.borrow_and_update(), &next);
     }
 
     #[test]

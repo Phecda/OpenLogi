@@ -278,7 +278,6 @@ fn side_gesture_capture_follows_platform_ownership_and_hook_availability() {
 
     let side_gesture_is_requested = |orch: &Orchestrator| {
         orch.shared.capture_plans.borrow()[0]
-            .target
             .spec
             .divert_gesture_buttons
             .iter()
@@ -353,7 +352,7 @@ fn keyboard_control_bindings_never_enter_the_mouse_capture_plan() {
 
     let plans = orch.shared.capture_plans.borrow();
     let plan = plans.first().expect("keyboard plan");
-    let spec = &plan.target.spec;
+    let spec = &plan.spec;
     let diverted_controls: Vec<u16> = spec
         .divert_buttons
         .iter()
@@ -405,7 +404,6 @@ fn a_control_the_keyboard_session_owns_leaves_the_keyboard_capture_plan() {
     );
     let plans = orch.shared.capture_plans.borrow();
     let diverted: Vec<u16> = plans[0]
-        .target
         .spec
         .divert_buttons
         .iter()
@@ -439,7 +437,6 @@ fn a_back_binding_alone_keeps_its_whole_family_on_a_keyboard() {
     assert!(orch.keyboard_spec_for().is_none());
     let plans = orch.shared.capture_plans.borrow();
     let diverted: Vec<u16> = plans[0]
-        .target
         .spec
         .divert_buttons
         .iter()

@@ -2,6 +2,7 @@
 //! diverts, the firmware state that records, and how it is re-armed and handed
 //! back.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hidpp::{channel::HidppChannel, device::Device};
@@ -25,6 +26,10 @@ use crate::{ChannelRegistry, SharedChannel};
 pub(super) struct ArmedControls {
     /// `0x1b04` accessor, present when the device exposes it.
     pub(super) reprog: Option<ReprogControlsV4>,
+    /// The device control table retained for in-place spec changes.
+    controls: Vec<reprog_controls::CtrlIdInfo>,
+    /// Effective diversion mode for each control currently owned by capture.
+    modes: BTreeMap<u16, ControlMode>,
     /// The gesture-source CIDs diverted with raw-XY reporting: the
     /// `spec.divert_gesture_sources` members the device exposes.
     pub(super) gesture_cids: Vec<u16>,
@@ -46,6 +51,19 @@ pub(super) struct ArmedControls {
 pub(super) struct ArmedThumbwheel {
     pub(super) wheel: Thumbwheel,
     info: Option<ThumbwheelInfo>,
+    pub(super) diverted: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlMode {
+    Plain,
+    RawXy,
+}
+
+impl ControlMode {
+    const fn raw_xy(self) -> bool {
+        matches!(self, Self::RawXy)
+    }
 }
 
 impl ArmedThumbwheel {
@@ -66,11 +84,11 @@ impl ArmedThumbwheel {
 impl ArmedControls {
     /// Build the one-time polarity fact learned while arming the thumb wheel.
     pub(super) fn thumbwheel_direction(&self) -> Option<CapturedInput> {
-        let positive_is_forward = self
-            .thumb
-            .as_ref()?
-            .info
-            .map(ThumbwheelInfo::positive_is_forward)?;
+        let thumb = self.thumb.as_ref()?;
+        if !thumb.diverted {
+            return None;
+        }
+        let positive_is_forward = thumb.info.map(ThumbwheelInfo::positive_is_forward)?;
         Some(CapturedInput::ThumbwheelDirection {
             positive_is_forward,
         })
@@ -91,20 +109,21 @@ impl ArmedControls {
         PendingCaptureRestore::new(
             retired,
             reprog,
-            thumb.as_ref().map(|thumb| thumb.wheel.feature_index()),
+            thumb
+                .as_ref()
+                .filter(|thumb| thumb.diverted)
+                .map(|thumb| thumb.wheel.feature_index()),
         )
     }
 
     /// Reapply volatile diversion after a wireless reconnect broadcast.
     pub(super) async fn rearm(&self) {
         if let Some(rc) = self.reprog.as_ref() {
-            for &reporting in &self.reporting {
-                let raw_xy = self.gesture_cids.contains(&reporting.cid)
-                    || self
-                        .gesture_button_cids
-                        .iter()
-                        .any(|&(cid, _)| cid == reporting.cid);
-                let change = divert_change(reporting.original, raw_xy);
+            for (&cid, &mode) in &self.modes {
+                let Some(reporting) = self.reporting.iter().find(|entry| entry.cid == cid) else {
+                    continue;
+                };
+                let change = divert_change(reporting.original, mode.raw_xy());
                 if let Err(error) = rc.set_cid_reporting_full(reporting.cid, change).await {
                     warn!(
                         cid = format_args!("{:#06x}", reporting.cid),
@@ -115,9 +134,108 @@ impl ArmedControls {
             }
         }
         if let Some(thumb) = self.thumb.as_ref()
+            && thumb.diverted
             && let Err(error) = thumb.wheel.divert(thumb.direction()).await
         {
             warn!(?error, "thumb-wheel re-divert after wake failed");
+        }
+    }
+
+    /// Apply a new specification without replacing the HID++ channel. The
+    /// desired mode is derived from the retained control table, so raw-XY
+    /// always wins over plain diversion for a control requested by both.
+    pub(super) async fn reconfigure(&mut self, spec: &CaptureSpec) -> Result<(), CaptureError> {
+        let result = self.reconfigure_inner(spec).await;
+        self.rebuild_lists(spec);
+        result
+    }
+
+    async fn reconfigure_inner(&mut self, spec: &CaptureSpec) -> Result<(), CaptureError> {
+        let desired = desired_modes(spec, &self.controls);
+        if let Some(rc) = self.reprog.clone() {
+            let mut cids: BTreeSet<u16> = self.modes.keys().copied().collect();
+            cids.extend(self.reporting.iter().map(|entry| entry.cid));
+            cids.extend(desired.keys().copied());
+            for cid in cids {
+                let current = self.modes.get(&cid).copied();
+                let wanted = desired.get(&cid).copied();
+                let uncertain_ownership = wanted.is_none()
+                    && current.is_none()
+                    && self.reporting.iter().any(|entry| entry.cid == cid);
+                if current == wanted && !uncertain_ownership {
+                    continue;
+                }
+                if let Some(mode) = wanted {
+                    let original =
+                        if let Some(entry) = self.reporting.iter().find(|entry| entry.cid == cid) {
+                            entry.original
+                        } else {
+                            let original = rc.get_cid_reporting(cid).await?;
+                            self.reporting.push(ArmedReporting { cid, original });
+                            original
+                        };
+                    rc.set_cid_reporting_full(cid, divert_change(original, mode.raw_xy()))
+                        .await?;
+                    self.modes.insert(cid, mode);
+                } else {
+                    let Some(entry) = self
+                        .reporting
+                        .iter()
+                        .find(|entry| entry.cid == cid)
+                        .copied()
+                    else {
+                        continue;
+                    };
+                    rc.set_cid_reporting_full(
+                        cid,
+                        crate::session::capture_restore::undivert_change(entry.original),
+                    )
+                    .await?;
+                    self.modes.remove(&cid);
+                    self.reporting.retain(|entry| entry.cid != cid);
+                }
+            }
+        }
+
+        if let Some(thumb) = self.thumb.as_mut() {
+            if spec.capture_thumbwheel && !thumb.diverted {
+                thumb.diverted = true;
+                thumb.wheel.divert(thumb.direction()).await?;
+            } else if !spec.capture_thumbwheel && thumb.diverted {
+                thumb.wheel.undivert().await?;
+                thumb.diverted = false;
+            }
+        }
+        self.rebuild_lists(spec);
+        Ok(())
+    }
+
+    fn rebuild_lists(&mut self, spec: &CaptureSpec) {
+        self.gesture_cids.clear();
+        self.gesture_button_cids.clear();
+        self.dpi_cids.clear();
+        self.button_cids.clear();
+        for &cid in &spec.divert_gesture_sources {
+            if self.modes.get(&cid) == Some(&ControlMode::RawXy) {
+                self.gesture_cids.push(cid);
+            }
+        }
+        for &(cid, button) in &spec.divert_gesture_buttons {
+            if self.modes.get(&cid) == Some(&ControlMode::RawXy)
+                && !self.gesture_cids.contains(&cid)
+            {
+                self.gesture_button_cids.push((cid, button));
+            }
+        }
+        for &cid in &reprog_controls::DPI_MODE_SHIFT_CIDS {
+            if self.modes.get(&cid) == Some(&ControlMode::Plain) {
+                self.dpi_cids.push(cid);
+            }
+        }
+        for &(cid, button) in &spec.divert_buttons {
+            if self.modes.get(&cid) == Some(&ControlMode::Plain) && !self.dpi_cids.contains(&cid) {
+                self.button_cids.push((cid, button));
+            }
         }
     }
 }
@@ -175,63 +293,11 @@ pub(super) async fn arm_controls_into(
         // Register an accessor before the first divert, so a failure on any
         // divert (including the first) can become a restore capability.
         armed.reprog = Some(rc.clone());
-
-        // Divert each gesture-mode source; a source not listed stays native
-        // (an idle HID++ control must not be captured-and-dropped).
-        for &cid in &spec.divert_gesture_sources {
-            if controls.iter().any(|c| c.cid == cid && c.supports_raw_xy()) {
-                arm_reprog_control(&rc, cid, true, &mut armed.reporting).await?;
-                armed.gesture_cids.push(cid);
-            }
-        }
-        for &(cid, button) in &spec.divert_gesture_buttons {
-            if let Some(control) = controls.iter().find(|c| c.cid == cid)
-                && control.is_divertable()
-                && control.supports_raw_xy()
-            {
-                arm_reprog_control(&rc, cid, true, &mut armed.reporting).await?;
-                armed.gesture_button_cids.push((cid, button));
-            }
-        }
-        for &cid in &reprog_controls::DPI_MODE_SHIFT_CIDS {
-            let gesture_requested = spec
-                .divert_gesture_buttons
-                .iter()
-                .any(|&(gesture_cid, button)| gesture_cid == cid && button == ButtonId::DpiToggle);
-            if gesture_requested {
-                // The raw-XY loop above owns a supported control. An
-                // unsupported one must stay native: plain-diverting it while
-                // dispatch still expects gesture events would swallow both
-                // the configured click and the firmware action.
-                continue;
-            }
-            if controls.iter().any(|c| c.cid == cid && c.is_divertable()) {
-                arm_reprog_control(&rc, cid, false, &mut armed.reporting).await?;
-                armed.dpi_cids.push(cid);
-            }
-        }
-        for &(cid, button) in &spec.divert_buttons {
-            // The plan never lists a raw-XY-diverted gesture source, but
-            // guard anyway: a plain (divert, no raw-XY) write here would strip
-            // the raw-XY reporting armed above.
-            if armed.gesture_cids.contains(&cid)
-                || armed
-                    .gesture_button_cids
-                    .iter()
-                    .any(|&(gesture_cid, _)| gesture_cid == cid)
-            {
-                continue;
-            }
-            if controls.iter().any(|c| c.cid == cid && c.is_divertable()) {
-                arm_reprog_control(&rc, cid, false, &mut armed.reporting).await?;
-                armed.button_cids.push((cid, button));
-            }
-        }
+        armed.controls.clone_from(&controls);
+        apply_reprog_spec(&rc, spec, armed).await?;
     }
 
-    if spec.capture_thumbwheel
-        && let Some(info) = device.root().get_feature(thumbwheel::FEATURE_ID).await?
-    {
+    if let Some(info) = device.root().get_feature(thumbwheel::FEATURE_ID).await? {
         let tw = Thumbwheel::new(Arc::clone(chan), slot, info.index);
         let wheel_info = match tw.get_info().await {
             Ok(twinfo) => Some(twinfo),
@@ -252,32 +318,76 @@ pub(super) async fn arm_controls_into(
         armed.thumb = Some(ArmedThumbwheel {
             wheel: tw,
             info: wheel_info,
+            diverted: false,
         });
-        if let Some(thumb) = armed.thumb.as_ref() {
+        if spec.capture_thumbwheel
+            && let Some(thumb) = armed.thumb.as_mut()
+        {
+            thumb.diverted = true;
             thumb.wheel.divert(thumb.direction()).await?;
         }
     }
     Ok(())
 }
 
-async fn arm_reprog_control(
-    rc: &ReprogControlsV4,
-    cid: u16,
-    raw_xy: bool,
-    reporting: &mut Vec<ArmedReporting>,
-) -> Result<(), CaptureError> {
-    let original = rc.get_cid_reporting(cid).await?;
-    if original.diverted {
-        // Left over from a session that never tore down (agent killed, or
-        // another Logitech app). Worth a line: it is the state that used to be
-        // replayed on restore, leaving the button dead.
-        debug!(cid, "control was already diverted before arming");
+fn desired_modes(
+    spec: &CaptureSpec,
+    controls: &[reprog_controls::CtrlIdInfo],
+) -> BTreeMap<u16, ControlMode> {
+    let mut modes = BTreeMap::new();
+    for &cid in &spec.divert_gesture_sources {
+        if controls
+            .iter()
+            .any(|control| control.cid == cid && control.supports_raw_xy())
+        {
+            modes.insert(cid, ControlMode::RawXy);
+        }
     }
-    let change = divert_change(original, raw_xy);
-    // Record ownership before the write: a transport error does not prove the
-    // firmware rejected the command, so rollback must cover this CID too.
-    reporting.push(ArmedReporting { cid, original });
-    rc.set_cid_reporting_full(cid, change).await?;
+    for &(cid, _) in &spec.divert_gesture_buttons {
+        if controls.iter().any(|control| {
+            control.cid == cid && control.is_divertable() && control.supports_raw_xy()
+        }) {
+            modes.insert(cid, ControlMode::RawXy);
+        }
+    }
+    for &cid in &reprog_controls::DPI_MODE_SHIFT_CIDS {
+        let gesture_requested = spec
+            .divert_gesture_buttons
+            .iter()
+            .any(|&(gesture_cid, button)| gesture_cid == cid && button == ButtonId::DpiToggle);
+        if !gesture_requested
+            && controls
+                .iter()
+                .any(|control| control.cid == cid && control.is_divertable())
+        {
+            modes.entry(cid).or_insert(ControlMode::Plain);
+        }
+    }
+    for &(cid, _) in &spec.divert_buttons {
+        if modes.get(&cid) != Some(&ControlMode::RawXy)
+            && controls
+                .iter()
+                .any(|control| control.cid == cid && control.is_divertable())
+        {
+            modes.entry(cid).or_insert(ControlMode::Plain);
+        }
+    }
+    modes
+}
+
+async fn apply_reprog_spec(
+    rc: &ReprogControlsV4,
+    spec: &CaptureSpec,
+    armed: &mut ArmedControls,
+) -> Result<(), CaptureError> {
+    for (cid, mode) in desired_modes(spec, &armed.controls) {
+        let original = rc.get_cid_reporting(cid).await?;
+        armed.reporting.push(ArmedReporting { cid, original });
+        rc.set_cid_reporting_full(cid, divert_change(original, mode.raw_xy()))
+            .await?;
+        armed.modes.insert(cid, mode);
+    }
+    armed.rebuild_lists(spec);
     Ok(())
 }
 
@@ -292,4 +402,61 @@ pub(crate) async fn enumerate_controls(
         controls.push(rc.get_ctrl_id_info(index).await?);
     }
     Ok(controls)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn control(cid: u16, raw_xy: bool) -> reprog_controls::CtrlIdInfo {
+        reprog_controls::CtrlIdInfo {
+            cid,
+            task_id: 0,
+            flags: (1 << 5) | if raw_xy { 1 << 8 } else { 0 },
+        }
+    }
+
+    #[test]
+    fn raw_xy_wins_when_a_control_is_requested_by_both_specs() {
+        let cid = 0x00c4;
+        let spec = CaptureSpec {
+            divert_gesture_buttons: vec![(cid, ButtonId::DpiToggle)],
+            divert_buttons: vec![(cid, ButtonId::DpiToggle)],
+            ..CaptureSpec::default()
+        };
+
+        assert_eq!(
+            desired_modes(&spec, &[control(cid, true)]),
+            BTreeMap::from([(cid, ControlMode::RawXy)])
+        );
+    }
+
+    #[test]
+    fn rebuilt_runtime_lists_follow_native_plain_and_raw_modes() {
+        let raw_cid = 0x00c4;
+        let plain_cid = 0x0052;
+        let spec = CaptureSpec {
+            divert_gesture_buttons: vec![(raw_cid, ButtonId::DpiToggle)],
+            divert_buttons: vec![(plain_cid, ButtonId::MiddleClick)],
+            ..CaptureSpec::default()
+        };
+        let mut armed = ArmedControls {
+            controls: vec![control(raw_cid, true), control(plain_cid, false)],
+            modes: BTreeMap::from([
+                (raw_cid, ControlMode::RawXy),
+                (plain_cid, ControlMode::Plain),
+            ]),
+            ..ArmedControls::default()
+        };
+
+        armed.rebuild_lists(&spec);
+
+        assert_eq!(
+            armed.gesture_button_cids,
+            vec![(raw_cid, ButtonId::DpiToggle)]
+        );
+        assert_eq!(armed.button_cids, vec![(plain_cid, ButtonId::MiddleClick)]);
+        assert!(armed.gesture_cids.is_empty());
+        assert!(armed.dpi_cids.is_empty());
+    }
 }

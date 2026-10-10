@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use openlogi_core::device_order::PhysicalDeviceKey;
 use openlogi_core::scroll::ScrollDelta;
+use openlogi_hid::session::gesture::CaptureSpec;
 use openlogi_hid::{
     CaptureHost, CaptureSessionOutcome, CaptureSessionStop, CapturedInput, DeviceRoute,
     PendingCaptureRestore, run_capture_session,
@@ -236,14 +237,26 @@ fn wanted_sessions(
 
 fn reconcile_session(
     session: &mut RunningSession,
-    wanted: Option<(&CaptureTarget, &DispatchPlan)>,
+    wanted: Option<(&CaptureTarget, &CaptureSpec, &DispatchPlan)>,
     dispatcher: &mut InputDispatcher,
-) {
-    if session.reconcile_with(wanted, stop_for_target_change) == ReconcileAction::DispatchChanged {
+) -> ReconcileAction {
+    let target_dispatch = wanted.map(|(target, _, dispatch)| (target, dispatch));
+    let action = session.reconcile_with(target_dispatch, stop_for_target_change);
+    if action == ReconcileAction::Retiring {
+        return action;
+    }
+    if let Some((_, spec, _)) = wanted
+        && !session.update_capture_spec(spec)
+    {
+        let _ = session.reconcile_with(None, stop_for_target_change);
+        return ReconcileAction::Retiring;
+    }
+    if action == ReconcileAction::DispatchChanged {
         dispatcher.cancel_session(session.id());
         let config_key = session.dispatch().config_key.clone();
         session.rekey(&config_key);
     }
+    action
 }
 
 fn stop_for_target_change(
@@ -278,7 +291,7 @@ fn reconcile_published_session(
             RoutePreference::Exact(&session.target().route),
             plans.as_slice(),
         )
-        .map(|plan| (&plan.target, &plan.dispatch));
+        .map(|plan| (&plan.target, &plan.spec, &plan.dispatch));
         reconcile_session(session, wanted, dispatcher);
     }
 }
@@ -419,7 +432,7 @@ impl GestureManagerState {
                 continue;
             };
             let wanted = select_plan(key, RoutePreference::Exact(&session.target().route), wanted)
-                .map(|plan| (&plan.target, &plan.dispatch));
+                .map(|plan| (&plan.target, &plan.spec, &plan.dispatch));
             reconcile_session(session, wanted, &mut self.input_dispatcher);
         }
         self.slots.retain(|key, slot| {
@@ -729,7 +742,9 @@ fn spawn_session(
     channels: &SessionChannels,
 ) -> RunningSession {
     let DeviceCapturePlan {
-        target, dispatch, ..
+        target,
+        spec,
+        dispatch,
     } = plan;
     let physical_key = target.physical_key.clone();
     let (stop_tx, stop_rx) = oneshot::channel();
@@ -747,7 +762,8 @@ fn spawn_session(
     let done_key = physical_key;
     let session_route = target.route.clone();
     let done_route = session_route.clone();
-    let session_spec = target.spec.clone();
+    let (spec_update_tx, spec_update_rx) = watch::channel(spec.clone());
+    let session_spec = spec.clone();
     let slot = Arc::clone(&channels.access.channel);
     let registry = channels.access.registry.clone();
     let device_io = channels.access.device_io.clone();
@@ -759,6 +775,7 @@ fn spawn_session(
             CaptureHost {
                 sink: session_tx,
                 shutdown: stop_rx,
+                spec_updates: Some(spec_update_rx),
                 channel_slot: slot,
                 registry: &registry,
                 device_io,
@@ -788,7 +805,7 @@ fn spawn_session(
         )
         .await;
     });
-    CaptureSession::active(id, target, dispatch, stop_tx)
+    CaptureSession::active_with_spec_updates(id, target, dispatch, spec, spec_update_tx, stop_tx)
 }
 
 #[cfg(test)]

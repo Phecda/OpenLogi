@@ -184,14 +184,36 @@ pub async fn run_capture_session(
 /// accumulator their reports feed.
 struct GestureCapture {
     armed: ArmedControls,
+    runtime: Arc<Mutex<GestureRuntime>>,
     /// Behind a `Mutex` because the channel's read thread invokes the report
     /// handler by shared reference.
     accum: Arc<Mutex<CaptureAccum>>,
 }
 
+struct GestureRuntime {
+    gesture_cids: Vec<u16>,
+    gesture_button_cids: Vec<(u16, ButtonId)>,
+    dpi_cids: Vec<u16>,
+    button_cids: Vec<(u16, ButtonId)>,
+    thumbwheel_diverted: bool,
+}
+
+impl GestureRuntime {
+    fn from_armed(armed: &ArmedControls) -> Self {
+        Self {
+            gesture_cids: armed.gesture_cids.clone(),
+            gesture_button_cids: armed.gesture_button_cids.clone(),
+            dpi_cids: armed.dpi_cids.clone(),
+            button_cids: armed.button_cids.clone(),
+            thumbwheel_diverted: armed.thumb.as_ref().is_some_and(|thumb| thumb.diverted),
+        }
+    }
+}
+
 impl GestureCapture {
     fn new(armed: ArmedControls) -> Self {
         Self {
+            runtime: Arc::new(Mutex::new(GestureRuntime::from_armed(&armed))),
             armed,
             accum: Arc::default(),
         }
@@ -221,21 +243,23 @@ impl ArmedCapture for GestureCapture {
         device_index: u8,
         sink: mpsc::UnboundedSender<CapturedInput>,
     ) -> impl Fn(&v20::Message) + Send + Sync + 'static {
-        let armed = &self.armed;
         let accum = Arc::clone(&self.accum);
-        let reprog_index = armed.reprog.as_ref().map(ReprogControlsV4::feature_index);
-        let gesture_cids = armed.gesture_cids.clone();
-        let gesture_button_set = armed.gesture_button_cids.clone();
-        let thumb_index = armed
+        let runtime = Arc::clone(&self.runtime);
+        let reprog_index = self
+            .armed
+            .reprog
+            .as_ref()
+            .map(ReprogControlsV4::feature_index);
+        let thumb_index = self
+            .armed
             .thumb
             .as_ref()
             .map(|thumb| thumb.wheel.feature_index());
-        let thumb_resolution = armed
+        let thumb_resolution = self
+            .armed
             .thumb
             .as_ref()
             .map_or(WheelResolution::UNKNOWN, ArmedThumbwheel::resolution);
-        let dpi_set = armed.dpi_cids.clone();
-        let button_set = armed.button_cids.clone();
         move |msg| {
             if let Some(idx) = reprog_index
                 && let Some(event) = reprog_controls::decode_event(msg, device_index, idx)
@@ -243,12 +267,13 @@ impl ArmedCapture for GestureCapture {
                 // Recover the guard even if a prior holder panicked — the
                 // critical section is panic-free, so the data is consistent.
                 let mut acc = accum.lock().unwrap_or_else(PoisonError::into_inner);
+                let runtime = runtime.lock().unwrap_or_else(PoisonError::into_inner);
                 acc.on_event(
                     event,
-                    &gesture_cids,
-                    &dpi_set,
-                    &gesture_button_set,
-                    &button_set,
+                    &runtime.gesture_cids,
+                    &runtime.dpi_cids,
+                    &runtime.gesture_button_cids,
+                    &runtime.button_cids,
                     &sink,
                 );
                 return;
@@ -256,6 +281,10 @@ impl ArmedCapture for GestureCapture {
             if let Some(idx) = thumb_index
                 && let Some(event) = thumbwheel::decode_event(msg, device_index, idx)
                 && let Some(input) = thumbwheel_input(event, thumb_resolution)
+                && runtime
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .thumbwheel_diverted
             {
                 let _ = sink.send(input);
             }
@@ -268,6 +297,48 @@ impl ArmedCapture for GestureCapture {
 
     async fn rearm(&self) {
         self.armed.rearm().await;
+    }
+
+    async fn reconfigure(&mut self, spec: &CaptureSpec) -> Result<(), CaptureError> {
+        let result = self.armed.reconfigure(spec).await;
+        let mut runtime = self.runtime.lock().unwrap_or_else(PoisonError::into_inner);
+        let old_gesture = runtime.gesture_cids.clone();
+        let old_dpi = runtime.dpi_cids.clone();
+        let old_buttons: Vec<u16> = runtime.button_cids.iter().map(|&(cid, _)| cid).collect();
+        let new_buttons: Vec<u16> = self.armed.button_cids.iter().map(|&(cid, _)| cid).collect();
+        runtime.gesture_cids.clone_from(&self.armed.gesture_cids);
+        runtime
+            .gesture_button_cids
+            .clone_from(&self.armed.gesture_button_cids);
+        runtime.dpi_cids.clone_from(&self.armed.dpi_cids);
+        runtime.button_cids.clone_from(&self.armed.button_cids);
+        runtime.thumbwheel_diverted = self
+            .armed
+            .thumb
+            .as_ref()
+            .is_some_and(|thumb| thumb.diverted);
+        let gesture_changed = old_gesture != runtime.gesture_cids;
+        let dpi_changed = old_dpi != runtime.dpi_cids;
+        drop(runtime);
+
+        let active: Vec<u16> = self
+            .armed
+            .button_cids
+            .iter()
+            .map(|&(cid, _)| cid)
+            .chain(self.armed.dpi_cids.iter().copied())
+            .collect();
+        let mut accum = self.accum.lock().unwrap_or_else(PoisonError::into_inner);
+        if gesture_changed {
+            accum.reset_gesture_state();
+        }
+        if dpi_changed {
+            accum.reset_dpi_state();
+        }
+        if old_buttons != new_buttons {
+            accum.retain_buttons(&active);
+        }
+        result
     }
 
     fn into_pending(self, retired: &SharedChannel) -> Option<PendingCaptureRestore> {

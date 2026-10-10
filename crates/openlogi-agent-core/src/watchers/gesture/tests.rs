@@ -39,7 +39,15 @@ fn plan_with_route(route: DeviceRoute) -> DeviceCapturePlan {
 
 fn live_session_from_plan(epoch: u64, plan: DeviceCapturePlan) -> RunningSession {
     let (stop, _rx) = oneshot::channel();
-    CaptureSession::active(session_id(epoch), plan.target, plan.dispatch, stop)
+    let (spec_updates, _updates_rx) = watch::channel(plan.spec.clone());
+    CaptureSession::active_with_spec_updates(
+        session_id(epoch),
+        plan.target,
+        plan.dispatch,
+        plan.spec,
+        spec_updates,
+        stop,
+    )
 }
 
 fn live_session_with_epoch(epoch: u64) -> RunningSession {
@@ -428,7 +436,6 @@ fn an_active_session_refreshes_bindings_without_rearming_hardware() {
         [(GestureDirection::Click, Action::MissionControl)].into(),
     );
     old_plan
-        .target
         .spec
         .divert_gesture_buttons
         .push((0x0056, ButtonId::Forward));
@@ -463,7 +470,6 @@ fn side_gesture_transition_keeps_the_retiring_plan_until_native_restore() {
         [(GestureDirection::Click, Action::MissionControl)].into(),
     );
     old_plan
-        .target
         .spec
         .divert_gesture_buttons
         .push((0x0056, ButtonId::Forward));
@@ -474,11 +480,8 @@ fn side_gesture_transition_keeps_the_retiring_plan_until_native_restore() {
         .dispatch
         .side_gesture_bindings
         .clear();
-    published_without_hook
-        .target
-        .spec
-        .divert_gesture_buttons
-        .clear();
+    published_without_hook.spec.divert_gesture_buttons.clear();
+    published_without_hook.target.rearm_generation = 1;
     assert_ne!(session.target(), &published_without_hook.target);
     assert_eq!(
         session.reconcile(Some((
@@ -498,8 +501,8 @@ fn side_gesture_transition_keeps_the_retiring_plan_until_native_restore() {
     );
     assert!(
         session
-            .target()
-            .spec
+            .capture_spec()
+            .expect("gesture session retains its original spec")
             .divert_gesture_buttons
             .iter()
             .any(|&(_, button)| button == ButtonId::Forward),
